@@ -86,3 +86,13 @@ pub fn call(
 /// Terminate a temporary supervised worker without linking its exit to caller.
 @external(erlang, "highway_runtime_ffi", "shutdown")
 pub fn shutdown(pid: process.Pid) -> Nil
+
+@external(erlang, "highway_runtime_ffi", "set_drained")
+pub fn set_drained(gate: Slots, drained: Bool) -> Nil
+
+@external(erlang, "highway_runtime_ffi", "is_drained")
+pub fn is_drained(gate: Slots) -> Bool
+
+/// BEAM allocated memory, not OS/container RSS. Used as a fixed node gauge.
+@external(erlang, "highway_runtime_ffi", "memory_bytes")
+pub fn memory_bytes() -> Int

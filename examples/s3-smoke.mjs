@@ -92,7 +92,7 @@ try {
   });
   const exit = await new Promise(resolve => conformance.once('exit', resolve)); assert.equal(exit, 0);
   await startServer();
-  assert.equal((await fetch(`${base}/readyz`)).status, 503);
+  await until(async () => (await fetch(`${base}/readyz`)).status === 200, 'initial storage readiness');
   const publisher = await connect();
   const seed = await publisher.publish('seed'); await progress(publisher, seed.cursor);
   const subscriber = await connect();

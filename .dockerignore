@@ -1,0 +1,9 @@
+.git
+build
+**/node_modules
+.env
+.env.*
+*.pem
+*.key
+coverage
+erl_crash.dump

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Highway browser client</title>
+<style>
+body{font:16px/1.5 system-ui,sans-serif;background:#f6f5f1;color:#182d2a;max-width:820px;margin:50px auto;padding:0 24px}h1{font-size:40px;letter-spacing:-1.8px;margin-bottom:6px}p{color:#536762}label{display:block;margin:15px 0 5px;font-weight:600}input,textarea,button{font:inherit;border:1px solid #a9bab5;border-radius:7px;padding:10px;box-sizing:border-box}input,textarea{width:100%;background:white}button{background:#195d4e;color:white;cursor:pointer;margin:14px 8px 0 0}button:disabled{opacity:.45;cursor:default}#status{background:#e2ece7;padding:12px;border-radius:8px}#events{padding:0;list-style:none}li{border-top:1px solid #cad5d0;padding:10px 0;font:13px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}small{color:#536762}
+</style>
+</head>
+<body>
+<h1>Highway</h1><p>Live streams with a separate record of persistence.</p>
+<div id="status" role="status">Disconnected</div>
+<div class="row"><div><label for="url">WebSocket URL</label><input id="url" value="ws://127.0.0.1:4000/v1/ws"></div><div><label for="stream">Stream</label><input id="stream" value="events"></div></div>
+<label for="token">JWT from your backend</label><input type="password" id="token" autocomplete="off" spellcheck="false" placeholder="Paste a short-lived token">
+<small>The token stays in memory. Subscribe and history grants are needed to resume after reconnect.</small><br>
+<button id="connect">Connect</button><button id="refresh" disabled>Use replacement token</button><button id="disconnect" disabled>Disconnect</button>
+<label for="data">Publish JSON</label><textarea id="data" rows="3">{"text":"Hello from the browser"}</textarea><button id="publish" disabled>Publish</button>
+<p id="progress">Accepted: 0 · Persistence notices: 0</p>
+<h2>Received events and boundaries</h2><small>Showing the latest 40 items. ACK follows processing; this page has no durable checkpoint store.</small><ul id="events"></ul>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

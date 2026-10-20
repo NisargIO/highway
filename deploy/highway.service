@@ -1,0 +1,25 @@
+[Unit]
+Description=Highway singleton stream service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=highway
+Group=highway
+WorkingDirectory=/opt/highway
+EnvironmentFile=/etc/highway/environment
+Environment=ERL_CRASH_DUMP=/dev/null
+ExecStart=/opt/highway/entrypoint.sh run
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

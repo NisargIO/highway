@@ -2,7 +2,7 @@
 
 Highway is a Gleam/OTP service for authorized live streams over WebSockets. Application backends issue signed JWT capabilities for exact tenant/stream actions. One owner orders each stream, and live delivery does not wait for storage.
 
-**Status: milestones 1–5 implemented locally.** Authenticated live streams now support explicit `development_memory` and `s3_async` storage. S3 writes immutable batches/indexes, conditionally commits the authoritative head, and allocates fresh durable epochs on recovery. Only confirmed head commits produce `persisted`; `accepted` remains admission to bounded memory and a crash can lose its pending tail. Authorized earliest/after replay joins committed history, pending memory, and later live events on one subscription, including interrupted epochs. Real AWS conformance is opt-in and has not been run in this session.
+**Status: milestones 1–6 implemented and verified locally.** Authenticated live streams now support explicit `development_memory` and `s3_async` storage. S3 writes immutable batches/indexes, conditionally commits the authoritative head, and allocates fresh durable epochs on recovery. Only confirmed head commits produce `persisted`; `accepted` remains admission to bounded memory and a crash can lose its pending tail. Authorized earliest/after replay joins committed history, pending memory, and later live events on one subscription, including interrupted epochs. Production packaging, bounded SIGTERM drain, storage/admission readiness, Prometheus metrics, and a Node.js/browser SDK are implemented. Real AWS conformance remains an opt-in release gate and has not been run here.
 
 ## Run the demonstration
 
@@ -13,11 +13,23 @@ make setup
 make check
 make smoke
 make smoke-s3
+make sdk-check
+make smoke-release
+# With Docker available:
+make smoke-container
 ```
 
 The [two-client smoke example](examples/smoke.mjs) generates an ephemeral signing key in memory, writes only its public JWKS to a temporary directory, starts an isolated server on `127.0.0.1:4401`, verifies ordered live delivery and failure cases, then stops the server process group and removes temporary files. Override `SMOKE_PORT` if necessary. No AWS account or third-party Node packages are needed.
 
 The [S3 network smoke](examples/s3-smoke.mjs) uses a loopback Python contract server plus the real signing/HTTP adapter. It checks live delivery while head commits are paused, no early persistence notice, lost head responses, crash recovery, exclusive lost-tail resume, finite snapshots, ordered replay/live handoff while publishing and evicting cache, subscribe-only archive continuation, and stale writer fencing. It runs without Docker or AWS. The fixture checks signing metadata but does not validate the signature cryptographically; use the opt-in AWS check before release.
+
+## Deploy and use clients
+
+`make release` exports a native OTP shipment. `make image` builds a digest-pinned non-root runtime container; `make smoke-container` verifies read-only execution and signal handling. See [deployment instructions](docs/deployment.md) for secrets, private S3 IAM, TLS/Caddy, readiness, metrics, graceful drain and stop-then-start upgrades. Exactly one server per prefix remains required.
+
+The [JavaScript SDK](sdk/javascript/README.md) supports Node.js 22+ and browsers, TypeScript declarations, token refresh, bounded async iteration, processed-cursor resume, and separate accepted/persisted events. It is implemented locally and has not been published to npm. Try [the Node example](examples/node-client.mjs) or serve the repository locally with `python3 -m http.server 3000 --bind 127.0.0.1` and open `http://localhost:3000/examples/browser/` for the [browser example](examples/browser/index.html). Obtain short-lived JWTs from your backend; no signing key belongs in either client. Create the stream with an authorized publish before subscribing.
+
+`make smoke-release` runs the real native shipment and SDK through drain/restart/replay and writes `build/benchmark.json`. [Local measurements and their limits](docs/benchmarks.md) include a deliberately small 64-record pending cap; defaults are not production throughput promises.
 
 ## Replay and continue live
 
@@ -41,9 +53,9 @@ export HIGHWAY_JWT_AUDIENCE=highway
 make run
 ```
 
-Storage mode must be selected explicitly; missing/unknown modes fail startup. `HIGHWAY_BIND` is restricted to `127.0.0.1`, and `HIGHWAY_PORT` defaults to `4000`. Browser Origin must equal `HIGHWAY_ORIGIN` (default `http://localhost:3000`); native clients without Origin are allowed on loopback. Query strings are rejected on `/v1/ws`; send tokens only in an `auth` frame.
+Storage mode must be selected explicitly; missing/unknown modes fail startup. `HIGHWAY_BIND` defaults to `127.0.0.1`; explicit `0.0.0.0` is supported behind a private TLS proxy, and `HIGHWAY_PORT` defaults to `4000`. Browser Origin must equal `HIGHWAY_ORIGIN` (default `http://localhost:3000`); native clients without Origin still require JWT authentication. Query strings are rejected on `/v1/ws`; send tokens only in an `auth` frame.
 
-`GET /healthz` returns 200. Memory readiness stays 503. S3 readiness remains 503 until storage initialization is confirmed for an owner, then reflects bounded owner/admission health. `/v1/ws` advertises the selected mode and `durable: false`: live acceptance never promises durability.
+`GET /healthz` returns 200. Memory readiness stays 503. S3 readiness requires a fresh successful read/write canary probe and available storage/admission capacity, even before the first stream. It becomes 503 during drain, stale/failed probes, owner degradation or full admission capacity. `/metrics` exposes fixed node-level Prometheus counters/gauges on the private listener. `/v1/ws` advertises the selected mode and `durable: false`: live acceptance never promises durability.
 
 An optional `HIGHWAY_LIMITS_FILE` points to a JSON object overriding validated positive limits: `max_connections`, `max_streams`, `stream_bytes`, `node_bytes`, `max_records`, `pending_age_ms`, `subscriptions`, `output_bytes`, `slow_ms`, `auth_ms`, `idle_ms`, `tick_ms`, `replay_workers`, `replay_pages_per_step`, `replay_max_pages`, and `replay_timeout_ms`. Defaults and fixed transport limits are in the [protocol](docs/protocol.md). In memory mode, all accepted data remains in memory until an owner terminates; publishes stop at the byte/record limit or 30 seconds after its first accepted event. Restart the demonstration to clear capacity. This is a bounded development adapter, not a continuously draining storage service.
 
@@ -63,7 +75,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 make run
 ```
 
-No credentials are stored in the repository. Environment credentials are fixed for the process lifetime. `HIGHWAY_S3_TIMEOUT_MS` defaults to 2000 (allowed 100–10000). Prefixes are nonempty, at most 64 bytes, and canonical lowercase path components; tenant/stream IDs are hex-encoded before becoming object keys. The service remains loopback-only until production packaging/TLS is implemented. Run exactly one server per prefix, using stop-then-start deployments.
+No credentials are stored in the repository. Environment credentials are fixed for the process lifetime. Each AWS credential also supports an exclusive `_FILE` setting for mounted secrets. `HIGHWAY_S3_TIMEOUT_MS` defaults to 2000 (allowed 100–10000). Prefixes are nonempty, at most 64 bytes, and canonical lowercase path components; tenant/stream IDs are hex-encoded before becoming object keys. Use the private backend with the documented TLS proxy for public access. Run exactly one server per prefix, using stop-then-start deployments.
 
 An owner's initial operation can return retryable `unavailable` while its worker allocates a durable epoch. Retry that command; no publish has been accepted during initialization. Thereafter, live append/fanout never waits on S3. Batches flush at 1 MiB or the next 250 ms timer, with one commit per stream and up to 16 active storage operations. Pending capacity is released only after the authoritative head commit. Storage outages retain accepted records and reject new admission at byte/record/age limits.
 
@@ -73,7 +85,7 @@ Before an AWS release, explicitly run:
 HIGHWAY_S3_CONFORMANCE=1 make s3-conformance
 ```
 
-This writes fresh test objects only under the configured prefix's `conformance/` subdirectory and leaves them for operator cleanup. It checks actual conditional writes and read visibility; normal tests never require AWS. See [Decision 002](docs/decisions/002-s3-archival.md) for the storage format, permissions, timeout reconciliation, and limitations.
+This writes fresh test objects only under the configured prefix's `conformance/` subdirectory and leaves them for operator cleanup. It checks actual conditional writes and read visibility; normal tests never require AWS. See [Decision 002](docs/decisions/002-s3-archival.md) for archival and [Decision 004](docs/decisions/004-production-operations.md) for v2 open/closed heads, drain, deployment, and migration. Segments/indexes remain v1; v1 open heads remain readable.
 
 ## Contract and limitations
 
@@ -82,7 +94,8 @@ This writes fresh test objects only under the configured prefix's `conformance/`
 - Earliest/after reads require history permission and resume exclusively. `follow: false` ends at the captured watermark, including its pending suffix. S3 recovery emits ordered `discontinuity` frames for uncertain tails, even when resuming beyond the archived prefix. Prior memory incarnations remain invalid.
 - Replay uses bounded workers, page steps, bytes, and time; `replay_limit` explicitly terminates excessive work. Latest subscriptions may fetch their own post-start backlog from S3 with only subscribe access. No missing cache range is silently skipped.
 - Expiry and the auth deadline apply on idle connections. Refresh keeps subject/tenant fixed and immediately cancels removed subscriptions.
-- This slice is loopback-only. Production TLS, tenant rate policies, credential refresh, graceful archival drain, deployment packaging, and performance validation remain future work.
+- SIGTERM closes admission, drains accepted records through authoritative head commits, and confirms closed heads before successful shutdown. Timeout exits nonzero; unconfirmed data stays uncertain. Recovery conservatively reports interruption boundaries even after clean shutdown.
+- TLS terminates at the proxy. Real AWS conformance, automatic AWS credential refresh, tenant rate policies, long-running scale validation, retention and distributed ownership remain future work.
 
 Builds apply a reviewed, hash-checked [Mist input-cap patch](patches/mist-input-cap.patch) before compilation. Use `make setup/check/run/smoke` so the cap is present. The Makefile also suppresses only JOSE's deprecated `catch` compiler warning under OTP 29; signature verification uses the maintained library's strict algorithm API. See the [implementation decision](docs/decisions/001-development-live.md).
 

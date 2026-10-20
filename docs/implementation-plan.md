@@ -73,11 +73,11 @@ Exit criteria: publish continuously during replay and assert ordered output with
 
 ## Milestone 6 Deployment and operational limits
 
-- [ ] Add production release/container packaging, explicit secrets configuration, TLS/proxy instructions, and private S3 IAM setup.
-- [ ] Add readiness based on storage/admission state, graceful drain, metrics, and structured redacted logs.
-- [ ] Provide a minimal browser/client SDK example with auth refresh, cursor resume, and accepted/persisted distinction.
-- [ ] Benchmark live latency, accepted-to-persisted lag, replay speed, memory at limits, and S3 request volume.
-- [ ] Test singleton stop-then-start upgrades and document the unsupported overlap/failover case.
+- [x] Add production release/container packaging, explicit secrets configuration, TLS/proxy instructions, and private S3 IAM setup.
+- [x] Add readiness based on storage/admission state, graceful drain, metrics, and structured redacted logs.
+- [x] Provide a minimal browser/client SDK example with auth refresh, cursor resume, and accepted/persisted distinction.
+- [x] Benchmark live latency, accepted-to-persisted lag, replay speed, memory at limits, and S3 request volume.
+- [x] Test singleton stop-then-start upgrades and document the unsupported overlap/failover case.
 
 Exit criteria: a documented single-node deployment passes an end-to-end publish, live receive, archive, restart, and replay scenario. Publish measured limits rather than guessed throughput targets. No retention deletion or automatic multi-node ownership in this release.
 
@@ -105,7 +105,7 @@ S3 archival/recovery is implemented in explicit `s3_async`. Decision 002 freezes
 
 The separate opt-in `s3-conformance` target is implemented for AWS conditional create/update, opaque ETags, read visibility, and concurrent immutable creation. It has not been run against real AWS here. The local fixture checks required SigV4/session metadata but does not verify signatures cryptographically. Docker was unavailable; no third-party emulator is claimed validated. Run AWS conformance before a production release.
 
-At the milestone 4 boundary, WebSocket replay and archive-backed continuation were still pending. Milestone 5 implements both; its limits and validation are below. Production TLS/packaging, ongoing credential refresh, graceful archive drain/clean epoch closure, metrics, performance sizing, and refined readiness remain milestone 6. Current server binding stays loopback. Exactly one server per storage prefix is required; CAS is not a distributed live ownership lease.
+At the milestone 4 boundary, WebSocket replay and archive-backed continuation were still pending. Milestone 5 implements both; its limits and validation are below. Production TLS/packaging, ongoing credential refresh, graceful archive drain/clean epoch closure, metrics, performance sizing, and refined readiness remain milestone 6. At that milestone the server bound only to loopback; milestone 6 adds explicit private wildcard binding. Exactly one server per storage prefix is required; CAS is not a distributed live ownership lease.
 
 ## Milestone 5 verification and handoff
 
@@ -113,4 +113,13 @@ Earliest/after/latest, finite snapshots, exclusive resume, and archive/live cont
 
 Validation: `make check` covers 54 tests. New cases include pinned-root traversal with advancing heads/orphan uploads, bounded page steps and total work, storage errors/corrupt cycles, crash-lost resume positions, multiple empty epochs, finite pending snapshots, live publication/cache eviction during replay, cross-epoch cumulative ACKs, subscribe-only post-floor S3 continuation, history removal/same-grant refresh, stale replies/subscription ID reuse, blocked-I/O expiry, owner/connection death, worker capacity, oversized replay, and negative Erlang monotonic timestamps. Expected safe warning/supervisor reports come from deliberate failure tests. `make smoke` verifies the memory live path; extended `make smoke-s3` verifies real Mist/HTTP clients replaying after full process restart, credit pauses with publication/cache eviction, exact H ordering, finite lost-tail resume, and latest-only archive continuation. Both require no AWS credentials; the fixture limitation from milestone 4 remains.
 
-Remaining limitations: reverse-linked history seeks can rescan pages for each batch and become expensive; explicit `replay_limit` bounds this work rather than silently truncating history. Initial replay has a configurable 30-second deadline including credit pauses. No retention, clean epoch closure, distributed ownership, or exactly-once claim. Production packaging/TLS, credential refresh, graceful drain, observability, performance measurements/checkpoint indexing, and refined readiness remain milestone 6 or later. Real AWS conformance is still outstanding. Next: milestone 6 only when requested.
+At the milestone 5 boundary, remaining limitations included: reverse-linked history seeks can rescan pages for each batch and become expensive; explicit `replay_limit` bounds this work rather than silently truncating history. Initial replay has a configurable 30-second deadline including credit pauses. No retention, clean epoch closure, distributed ownership, or exactly-once claim. Production packaging/TLS, credential refresh, graceful drain, observability, performance measurements/checkpoint indexing, and refined readiness remain milestone 6 or later. Real AWS conformance is still outstanding. This was the milestone 5 boundary; milestone 6 is recorded below.
+
+
+## Milestone 6 verification and handoff
+
+Milestone 6 is implemented locally. Decision 004 records native/digest-pinned container packaging, private TLS/IAM/secrets examples, bounded SIGTERM barriers and authoritative final commits/closed heads, active write/read storage probing, fixed-cardinality metrics, structured redacted logs, and the shared Node.js/browser SDK. Heads write v2 open/closed status and read legacy v1 open heads; segment/index/wire formats remain v1. Graceful closure does not reuse epochs or replace conservative restart boundaries. The SDK is locally packaged with declarations and is not published to npm.
+
+Validation: `make check` covers 64 Gleam tests and 13 SDK tests, including drain saturation/retries, pending and ambiguous-close commit boundaries, timeout without false persistence/closure, close fencing/legacy decode, stale blocked probes and empty-service readiness, admission capacity, secret-file conflicts/redaction, operational latch/activity cleanup, finite ACK/completion race receipts with count/position bounds, and SDK credit/reconnect/refresh/unknown publish outcomes. `make sdk-check` verifies TypeScript declarations with a typed consumer. `make smoke` and `make smoke-s3` retain live/JWT/crash/replay coverage. `make smoke-release` runs the native shipment with the actual SDK, mounted credentials, SIGTERM admission rejection, confirmed final notices, clean and failed drain exits, singleton restart/resume, finite replay, and a measured 64-record pending cap. `make smoke-container` builds and exercises the non-root read-only Linux runtime, public JWKS mount, JWT live streams, metrics, and SIGTERM. Local container validation uses Linux arm64 on OrbStack; CI is configured to run the container smoke on Linux amd64. Local samples and their bounds are documented in benchmarks.md; they do not establish production-scale throughput or AWS costs.
+
+Release gates/remaining limits: real AWS conformance and actual deployment-specific IAM/TLS validation remain outstanding; the contract fixture is not a SigV4 verifier. AWS credentials are process-static; JWT refresh is supported. Exactly one server per prefix and stop-then-start upgrades remain required. Tenant rate policies, a maintained AWS credential provider chain, checkpoint/range indexing, long-running/high-cardinality load testing, retention deletion, clustering and failover are not implemented. Container images and the SDK are not published externally. No further milestone is implied without a new request. Keep committing/pushing coherent verified changes as requested.

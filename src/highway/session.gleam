@@ -42,6 +42,15 @@ pub type Watch {
   Watch(owner: Owner, through: Option(domain.Cursor), publisher: Bool)
 }
 
+pub type Receipt {
+  Receipt(stream: Stream, credit: flow.Credit, historical: Bool)
+}
+
+type AckTarget {
+  Active(Subscription)
+  Completed(Receipt)
+}
+
 pub type State {
   State(
     claims: Option(Claims),
@@ -51,6 +60,7 @@ pub type State {
     rotation: Int,
     watches: Dict(Stream, Watch),
     replies: process.Subject(replay.Reply),
+    completed: List(#(String, Receipt)),
   )
 }
 
@@ -59,7 +69,7 @@ pub type Step {
 }
 
 pub fn new(now: Int) -> State {
-  State(None, dict.new(), now, now, 0, dict.new(), process.new_subject())
+  State(None, dict.new(), now, now, 0, dict.new(), process.new_subject(), [])
 }
 
 fn success(state: State, responses: List(Response)) -> Step {
@@ -73,7 +83,7 @@ fn failure(state: State, id: String, sub: String, error: Error) -> Step {
 pub fn disconnect(state: State, error: Error, code: Int) -> Step {
   cleanup(state)
   Step(
-    State(..state, subscriptions: dict.new()),
+    State(..state, subscriptions: dict.new(), completed: []),
     [protocol.Failure("", "", error)],
     Some(code),
   )
@@ -173,7 +183,14 @@ fn command_step(
               let domain.Tenant(tenant) = claims.tenant
               success(
                 prune_watches(
-                  State(..state, claims: Some(claims), subscriptions: subs),
+                  State(
+                    ..state,
+                    claims: Some(claims),
+                    subscriptions: subs,
+                    completed: list.filter(state.completed, fn(pair) {
+                      receipt_allowed(claims, pair.1, now) == Ok(Nil)
+                    }),
+                  ),
                   claims,
                   now,
                 ),
@@ -297,6 +314,11 @@ fn authorized_command(
               0,
               captured.high,
             )
+          let state =
+            State(
+              ..state,
+              completed: list.filter(state.completed, fn(pair) { pair.0 != sub }),
+            )
           let state = case config.storage {
             config.S3(_) if follow -> watch(state, stream, o, False)
             _ -> state
@@ -325,29 +347,53 @@ fn authorized_command(
     }
     protocol.Ack(sub, through) -> {
       let outcome = {
-        use s <- result.try(
-          dict.get(state.subscriptions, sub)
-          |> result.replace_error(domain.InvalidFrame),
-        )
+        use target <- result.try(case dict.get(state.subscriptions, sub) {
+          Ok(s) -> Ok(Active(s))
+          Error(_) ->
+            list.find(state.completed, fn(pair) { pair.0 == sub })
+            |> result.map(fn(pair) { Completed(pair.1) })
+            |> result.replace_error(domain.InvalidFrame)
+        })
+        let stream = case target {
+          Active(s) -> s.stream
+          Completed(r) -> r.stream
+        }
         use _ <- result.try(auth.authorize(
           claims,
           claims.tenant,
-          s.stream,
+          stream,
           domain.Subscribe,
           now,
         ))
-        use credit <- result.try(flow.ack(s.credit, through))
-        Ok(Subscription(..s, credit: credit))
-      }
-      case outcome {
-        Ok(s) ->
-          success(
+        let credit = case target {
+          Active(s) -> s.credit
+          Completed(r) -> r.credit
+        }
+        use credit <- result.try(flow.ack(credit, through))
+        Ok(case target {
+          Active(s) ->
             State(
               ..state,
-              subscriptions: dict.insert(state.subscriptions, sub, s),
-            ),
-            [],
-          )
+              subscriptions: dict.insert(
+                state.subscriptions,
+                sub,
+                Subscription(..s, credit: credit),
+              ),
+            )
+          Completed(_) ->
+            State(
+              ..state,
+              completed: list.map(state.completed, fn(pair) {
+                case pair.0 == sub {
+                  True -> #(sub, Receipt(..pair.1, credit: credit))
+                  False -> pair
+                }
+              }),
+            )
+        })
+      }
+      case outcome {
+        Ok(next) -> success(next, [])
         Error(e) -> failure(state, "", sub, e)
       }
     }
@@ -442,15 +488,39 @@ pub fn tick(state: State, config: Config, now: Int, ms: Int) -> Step {
                         busy || other.job != None
                       }),
                     )
-                  let subs = case updated {
-                    Some(s) -> dict.insert(state.subscriptions, id, s)
+                  let complete =
+                    list.any(produced, fn(frame) {
+                      frame == protocol.Complete(id)
+                    })
+                  let #(subs, receipts) = case updated {
+                    Some(s) if complete -> {
+                      close_sub(s)
+                      let receipts =
+                        list.append(
+                          list.filter(state.completed, fn(pair) { pair.0 != id }),
+                          [
+                            #(
+                              id,
+                              Receipt(s.stream, s.credit, s.view.historical),
+                            ),
+                          ],
+                        )
+                      #(
+                        dict.delete(state.subscriptions, id),
+                        bound_receipts(receipts),
+                      )
+                    }
+                    Some(s) -> #(
+                      dict.insert(state.subscriptions, id, s),
+                      state.completed,
+                    )
                     None -> {
                       close_sub(sub)
-                      dict.delete(state.subscriptions, id)
+                      #(dict.delete(state.subscriptions, id), state.completed)
                     }
                   }
                   #(
-                    State(..state, subscriptions: subs),
+                    State(..state, subscriptions: subs, completed: receipts),
                     list.append(produced, frames),
                     remaining,
                     option.or(fatal, close),
@@ -553,7 +623,7 @@ fn pump(
               let frames = [protocol.CaughtUp(id, s.view.high), ..frames]
               case s.follow {
                 False -> #(
-                  None,
+                  Some(Subscription(..s, caught_up: True)),
                   [protocol.Complete(id), ..frames],
                   budget,
                   None,
@@ -1011,4 +1081,39 @@ fn progress(state: State, claims: Claims, now: Int) -> Step {
         }
     }
   })
+}
+
+/// Completed subscriptions release owners/payloads immediately. Up to 64 final
+/// credit receipts tolerate already-in-flight ACKs, with the same delivered-
+/// cursor checks. Refresh/reuse/disconnect invalidate the relevant receipts.
+fn receipt_allowed(
+  claims: Claims,
+  receipt: Receipt,
+  now: Int,
+) -> Result(Nil, Error) {
+  use _ <- result.try(auth.authorize(
+    claims,
+    claims.tenant,
+    receipt.stream,
+    domain.Subscribe,
+    now,
+  ))
+  case receipt.historical {
+    True ->
+      auth.authorize(claims, claims.tenant, receipt.stream, domain.History, now)
+    False -> Ok(Nil)
+  }
+}
+
+fn bound_receipts(
+  receipts: List(#(String, Receipt)),
+) -> List(#(String, Receipt)) {
+  let pending =
+    list.fold(receipts, 0, fn(n, pair) {
+      n + list.length(pair.1.credit.pending)
+    })
+  case list.length(receipts) > 64 || pending > 1024 {
+    True -> bound_receipts(list.drop(receipts, 1))
+    False -> receipts
+  }
 }

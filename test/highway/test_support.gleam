@@ -33,6 +33,7 @@ pub fn config(key: Key) -> config.Config {
     ["http://localhost:3000"],
     config.defaults(),
     config.DevelopmentMemory,
+    config.operational_defaults(),
   )
 }
 

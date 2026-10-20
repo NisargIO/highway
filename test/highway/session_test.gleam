@@ -539,3 +539,85 @@ pub fn replay_deadline_includes_credit_pauses_without_false_completion_test() {
   assert exhausted.close == None
   registry.stop(reg)
 }
+
+pub fn finite_completion_retains_bounded_validated_late_ack_receipts_test() {
+  let key = support.key()
+  let cfg = support.config(key)
+  let service = service(cfg.limits)
+  let reg = service.data
+  let stream = domain.Stream("events")
+  let assert Ok(_) =
+    registry.publish(reg, domain.Tenant("tenant"), stream, "seed", json.null())
+  let initial = state(key, ["subscribe", "history"])
+  let replay = fn(s, n) {
+    let id = int.to_string(n)
+    let begun =
+      session.handle(
+        s,
+        protocol.Subscribe(id, id, stream, protocol.Earliest, False, 128),
+        cfg,
+        reg,
+        1000,
+        0,
+      )
+    let delivered = session.tick(begun.state, cfg, 1000, 1)
+    let delivered = case dict.size(delivered.state.subscriptions) > 0 {
+      True -> session.tick(delivered.state, cfg, 1000, 2)
+      False -> delivered
+    }
+    assert list.contains(delivered.responses, protocol.Complete(id))
+    delivered.state
+  }
+  let done = list.fold(int.range(70, 0, [], list.prepend), initial, replay)
+  assert dict.size(done.subscriptions) == 0
+  assert list.length(done.completed) == 64
+  // Bound aggregate cursor metadata as well as completed subscription count.
+  let events =
+    list.map(int.range(16, 0, [], list.prepend), fn(_) {
+      let assert Ok(e) =
+        registry.publish(reg, domain.Tenant("tenant"), stream, "m", json.null())
+      e
+    })
+  let assert Ok(event) = list.last(events)
+  let done = list.fold(int.range(140, 70, [], list.prepend), done, replay)
+  assert list.length(done.completed) == 60
+  assert list.fold(done.completed, 0, fn(n, pair) {
+      n + list.length(pair.1.credit.pending)
+    })
+    <= 1024
+  let acked =
+    session.handle(done, protocol.Ack("140", event.cursor), cfg, reg, 1000, 2)
+  assert acked.responses == []
+  assert session.handle(
+      acked.state,
+      protocol.Ack("140", event.cursor),
+      cfg,
+      reg,
+      1000,
+      3,
+    ).responses
+    == []
+  let future = domain.Cursor(..event.cursor, offset: event.cursor.offset + 1)
+  assert session.handle(done, protocol.Ack("140", future), cfg, reg, 1000, 2).responses
+    == [protocol.Failure("", "140", domain.CursorInvalid)]
+  assert session.handle(
+      done,
+      protocol.Ack("1", event.cursor),
+      cfg,
+      reg,
+      1000,
+      2,
+    ).responses
+    == [protocol.Failure("", "1", domain.InvalidFrame)]
+  let refreshed =
+    session.handle(
+      done,
+      protocol.Auth("r", support.token(key, ["publish"])),
+      cfg,
+      reg,
+      1000,
+      2,
+    )
+  assert refreshed.state.completed == []
+  registry.stop(reg)
+}

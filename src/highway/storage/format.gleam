@@ -17,6 +17,7 @@ pub type Head {
     index: Option(String),
     archived: Cursor,
     commit_id: String,
+    closed: Bool,
   )
 }
 
@@ -75,17 +76,33 @@ pub fn decode_head(bytes: String) -> Result(Head, Error) {
   use h <- result.try(parse(
     bytes,
     {
-      use _ <- decode.then(version())
+      use v <- decode.field("version", decode.int)
       use incarnation <- decode.field("incarnation", protocol.name())
       use epoch <- decode.field("epoch", decimal())
       use status <- decode.field("status", decode.string)
       use index <- decode.field("index", decode.optional(decode.string))
       use archived <- decode.field("archived", cursor())
       use commit <- decode.field("commit_id", protocol.name())
-      case status == "open" && epoch > 0 {
+      case
+        {
+          v == 1
+          && status == "open"
+          || v == 2
+          && { status == "open" || status == "closed" }
+        }
+        && epoch > 0
+      {
         True ->
-          decode.success(Head(incarnation, epoch, index, archived, commit))
-        False -> decode.failure(Head("", 1, None, archived, ""), "open epoch")
+          decode.success(Head(
+            incarnation,
+            epoch,
+            index,
+            archived,
+            commit,
+            status == "closed",
+          ))
+        False ->
+          decode.failure(Head("", 1, None, archived, "", False), "open epoch")
       }
     },
     "head format",
@@ -102,10 +119,16 @@ pub fn decode_head(bytes: String) -> Result(Head, Error) {
 
 pub fn head(h: Head) -> String {
   json.object([
-    #("version", json.int(1)),
+    #("version", json.int(2)),
     #("incarnation", json.string(h.incarnation)),
     #("epoch", dec(h.epoch)),
-    #("status", json.string("open")),
+    #(
+      "status",
+      json.string(case h.closed {
+        True -> "closed"
+        False -> "open"
+      }),
+    ),
     #("index", json.nullable(h.index, json.string)),
     #("archived", cur(h.archived)),
     #("commit_id", json.string(h.commit_id)),

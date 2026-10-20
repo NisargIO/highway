@@ -16,19 +16,33 @@ pub fn handle(
   slots: runtime.Slots,
 ) -> Response(ResponseData) {
   case req.method, request.path_segments(req) {
+    http.Get, ["metrics"] ->
+      response.new(200)
+      |> response.set_header(
+        "content-type",
+        "text/plain; version=0.0.4; charset=utf-8",
+      )
+      |> response.set_header("cache-control", "no-store")
+      |> response.set_body(
+        mist.Bytes(bytes_tree.from_string(registry.metrics(registry))),
+      )
     http.Get, ["v1", "ws"] ->
-      case allowed_origin(req, config.origins) && req.query == option.None {
-        False -> json(403, "{\"error\":\"forbidden\"}")
-        True -> {
-          // Disable compression: bounded input must also bound decoded bytes.
-          let req = request.set_header(req, "sec-websocket-extensions", "")
-          mist.websocket(
-            req,
-            fn(s, m, c) { websocket.handle(s, m, c, config, registry) },
-            websocket.init(_, config, slots),
-            websocket.cleanup(_, slots),
-          )
-        }
+      case registry.draining(registry) {
+        True -> json(503, "{\"error\":\"draining\"}")
+        False ->
+          case allowed_origin(req, config.origins) && req.query == option.None {
+            False -> json(403, "{\"error\":\"forbidden\"}")
+            True -> {
+              // Disable compression: bounded input must also bound decoded bytes.
+              let req = request.set_header(req, "sec-websocket-extensions", "")
+              mist.websocket(
+                req,
+                fn(s, m, c) { websocket.handle(s, m, c, config, registry) },
+                websocket.init(_, config, slots, registry),
+                websocket.cleanup(_, slots, registry),
+              )
+            }
+          }
       }
     http.Get, ["readyz"] ->
       case config.storage {
@@ -57,7 +71,7 @@ pub fn allowed_origin(req: Request(body), origins: List(String)) -> Bool {
   }
 }
 
-/// Native clients without Origin are allowed only on the enforced loopback bind.
+/// Native clients still require JWTs; the TLS proxy must keep admin routes private.
 pub fn basic(req: Request(body)) -> Response(ResponseData) {
   case req.method {
     http.Get ->

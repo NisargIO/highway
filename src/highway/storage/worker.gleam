@@ -9,11 +9,13 @@ import highway/storage/archive
 pub type Request {
   Open(scope: String, create: Bool, reply: Subject(Reply))
   Commit(plan: archive.Plan, reply: Subject(Reply))
+  Close(archive.Closure, Subject(Reply))
   OwnerDown
 }
 
 pub type Reply {
   Opened(Result(archive.Session, Error))
+  Closed(epoch: Int, id: String, result: Result(archive.Session, Error))
   Committed(
     epoch: Int,
     batch_id: String,
@@ -42,6 +44,14 @@ pub fn start(
   |> actor.on_message(fn(_, request) {
     case request {
       OwnerDown -> actor.stop()
+      Close(plan, reply) -> {
+        let outcome = bounded(slots, fn() { archive.close(store, plan) })
+        process.send(
+          reply,
+          Closed(plan.next.epoch, plan.next.commit_id, outcome),
+        )
+        actor.continue(Nil)
+      }
       Open(scope, create, reply) -> {
         let outcome =
           bounded(slots, fn() { archive.open(store, scope, create) })

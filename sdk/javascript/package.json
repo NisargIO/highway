@@ -1,0 +1,33 @@
+{
+  "name": "@nisargio/highway",
+  "version": "0.1.0",
+  "description": "Bounded Highway WebSocket client for Node.js 22+ and browsers",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "types": "./index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "tsc --noEmit --strict --target es2022 --module nodenext --moduleResolution nodenext --lib es2022,dom test/types.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NisargIO/highway",
+    "directory": "sdk/javascript"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

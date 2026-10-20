@@ -7,6 +7,8 @@ import gleam/result
 import gleam/string
 import highway/config.{type Limits}
 import highway/domain.{type Cursor, type Error, type Event}
+import highway/observability as logging
+import highway/operations
 import highway/protocol
 import highway/replay/view
 import highway/runtime
@@ -14,7 +16,6 @@ import highway/storage.{type Store}
 import highway/storage/archive
 import highway/storage/worker
 import highway/stream
-import logging
 
 pub opaque type Owner {
   Owner(subject: Subject(Message), gate: runtime.Slots)
@@ -27,6 +28,7 @@ type Message {
 }
 
 type Operation {
+  Drain
   Capture(protocol.From, process.Pid, Subject(Result(view.View, Error)))
   Pull(String, Cursor, Subject(Result(view.Pull, Error)))
   Release(String)
@@ -45,6 +47,9 @@ type ArchiveState {
   Writing(archive.Plan)
   Retrying(archive.Plan)
   Fenced
+  Closing(archive.Closure)
+  RetryClose(archive.Closure)
+  Closed
 }
 
 type State {
@@ -59,6 +64,8 @@ type State {
     retry_ms: Int,
     create: Bool,
     leases: dict.Dict(String, view.Lease),
+    draining: Bool,
+    metrics: Option(operations.Context),
   )
 }
 
@@ -72,6 +79,17 @@ pub fn start_storage(
   scope: String,
   create: Bool,
   slots: runtime.Slots,
+) -> actor.StartResult(Owner) {
+  start_operational(limits, store, scope, create, slots, None)
+}
+
+pub fn start_operational(
+  limits: Limits,
+  store: Option(Store),
+  scope: String,
+  create: Bool,
+  slots: runtime.Slots,
+  metrics: Option(operations.Context),
 ) -> actor.StartResult(Owner) {
   actor.new_with_initialiser(1000, fn(subject) {
     let gate = runtime.slots()
@@ -88,6 +106,8 @@ pub fn start_storage(
         0,
         create,
         dict.new(),
+        False,
+        metrics,
       )
     let initial = case store {
       None -> Ok(initial)
@@ -117,6 +137,11 @@ pub fn start_storage(
       Request(permit, op) -> {
         runtime.release_permit(state.gate, permit)
         case op {
+          Drain -> {
+            let next = drain_step(State(..state, draining: True))
+            account(next, limits)
+            actor.continue(next)
+          }
           Capture(from, connection, reply) -> {
             let state = clean_leases(state)
             let captured = capture(state, from)
@@ -170,41 +195,65 @@ pub fn start_storage(
             actor.stop()
           }
           Append(id, data, now, reply) ->
-            case state.archive {
-              Starting | Missing -> {
-                let next = send_open(state, True)
-                runtime.release_bytes(state.gate, stream.event_bytes(id, data))
-                process.send(reply, Error(domain.Unavailable))
-                actor.continue(next)
-              }
-              Opening | Fenced -> {
+            case state.draining {
+              True -> {
                 runtime.release_bytes(state.gate, stream.event_bytes(id, data))
                 process.send(reply, Error(domain.Unavailable))
                 actor.continue(state)
               }
-              _ ->
-                case stream.append(state.stream, id, data, limits, now) {
-                  Error(e) -> {
+              False ->
+                case state.archive {
+                  Starting | Missing -> {
+                    let next = send_open(state, True)
                     runtime.release_bytes(
                       state.gate,
                       stream.event_bytes(id, data),
                     )
-                    process.send(reply, Error(e))
+                    process.send(reply, Error(domain.Unavailable))
+                    actor.continue(next)
+                  }
+                  Opening | Fenced -> {
+                    runtime.release_bytes(
+                      state.gate,
+                      stream.event_bytes(id, data),
+                    )
+                    process.send(reply, Error(domain.Unavailable))
                     actor.continue(state)
                   }
-                  Ok(#(next, event)) -> {
-                    let next = State(..state, stream: next)
-                    account(next, limits)
-                    runtime.release_bytes(
-                      state.gate,
-                      stream.event_bytes(id, data),
-                    )
-                    process.send(reply, Ok(event))
-                    actor.continue(case next.stream.bytes >= 1_048_576 {
-                      True -> flush(next)
-                      False -> next
-                    })
-                  }
+                  _ ->
+                    case stream.append(state.stream, id, data, limits, now) {
+                      Error(e) -> {
+                        runtime.release_bytes(
+                          state.gate,
+                          stream.event_bytes(id, data),
+                        )
+                        process.send(reply, Error(e))
+                        actor.continue(state)
+                      }
+                      Ok(#(next, event)) -> {
+                        let next = State(..state, stream: next)
+                        account(next, limits)
+                        runtime.release_bytes(
+                          state.gate,
+                          stream.event_bytes(id, data),
+                        )
+                        operations.record(
+                          next.metrics,
+                          operations.AcceptedEvents,
+                          1,
+                        )
+                        operations.record(
+                          next.metrics,
+                          operations.AcceptedBytes,
+                          event.bytes,
+                        )
+                        process.send(reply, Ok(event))
+                        actor.continue(case next.stream.bytes >= 1_048_576 {
+                          True -> flush(next)
+                          False -> next
+                        })
+                      }
+                    }
                 }
             }
           Watermark(reply) -> {
@@ -230,13 +279,52 @@ pub fn start_storage(
         let state = clean_leases(state)
         let next = case state.archive {
           Starting -> send_open(state, state.create)
+          RetryClose(plan) ->
+            case runtime.monotonic_ms() >= state.retry_ms {
+              True -> send_close(state, plan)
+              False -> state
+            }
           Retrying(plan) ->
             case runtime.monotonic_ms() >= state.retry_ms {
               True -> send_commit(state, plan)
               False -> state
             }
-          Active(_) -> flush(state)
+          Active(_) ->
+            case state.draining {
+              True -> drain_step(state)
+              False -> flush(state)
+            }
           _ -> state
+        }
+        account(next, limits)
+        actor.continue(next)
+      }
+      Storage(worker.Closed(epoch, id, outcome)) -> {
+        let next = case state.archive {
+          Closing(plan)
+            if plan.next.epoch == epoch && plan.next.commit_id == id
+          ->
+            case outcome {
+              Ok(_) -> State(..state, archive: Closed)
+              Error(storage.Conflict)
+              | Error(storage.Precondition)
+              | Error(storage.Corrupt(_)) -> {
+                log_error(outcome)
+                State(..state, archive: Fenced)
+              }
+              Error(_) -> {
+                log_error(outcome)
+                State(
+                  ..state,
+                  archive: RetryClose(plan),
+                  retry_ms: runtime.monotonic_ms() + 1000,
+                )
+              }
+            }
+          _ -> {
+            logging.log(logging.Warning, "Discarded stale close completion")
+            state
+          }
         }
         account(next, limits)
         actor.continue(next)
@@ -279,8 +367,24 @@ pub fn start_storage(
             case outcome {
               Ok(session) ->
                 case stream.committed(state.stream, session.head.archived) {
-                  Ok(model) ->
-                    State(..state, stream: model, archive: Active(session))
+                  Ok(model) -> {
+                    operations.record(
+                      state.metrics,
+                      operations.PersistedEvents,
+                      model.persisted - state.stream.persisted,
+                    )
+                    operations.record(
+                      state.metrics,
+                      operations.PersistedBytes,
+                      state.stream.bytes - model.bytes,
+                    )
+                    let next =
+                      State(..state, stream: model, archive: Active(session))
+                    case next.draining {
+                      True -> drain_step(next)
+                      False -> next
+                    }
+                  }
                   Error(_) -> State(..state, archive: Fenced)
                 }
               Error(storage.Conflict)
@@ -365,10 +469,24 @@ fn flush(state: State) -> State {
 }
 
 fn account(s: State, limits: Limits) -> Nil {
+  runtime.set_drained(
+    s.gate,
+    s.archive == Closed
+      || s.archive == Missing
+      || { s.archive == Memory && s.draining },
+  )
   runtime.set_missing(s.gate, s.archive == Missing)
   let healthy = case s.archive {
     Active(_) | Writing(_) -> True
-    Memory | Starting | Missing | Opening | Retrying(_) | Fenced -> False
+    Memory
+    | Starting
+    | Missing
+    | Opening
+    | Retrying(_)
+    | Fenced
+    | Closing(_)
+    | RetryClose(_)
+    | Closed -> False
   }
   let age_ok = case s.stream.oldest_ms {
     None -> True
@@ -479,6 +597,10 @@ fn clean_leases(s: State) -> State {
 }
 
 fn capture(s: State, from: protocol.From) -> Result(view.View, Error) {
+  use _ <- result.try(case s.draining {
+    True -> Error(domain.Unavailable)
+    False -> Ok(Nil)
+  })
   use _ <- result.try(case s.archive {
     Starting | Opening | Fenced -> Error(domain.Unavailable)
     Missing -> Error(domain.StreamNotFound)
@@ -577,4 +699,37 @@ pub fn release(o: Owner, v: view.View) -> Nil {
     }
     Ok(permit) -> process.send(o.subject, Request(permit, Release(v.id)))
   }
+}
+
+fn drain_step(state: State) -> State {
+  case state.archive {
+    Active(session) ->
+      case state.stream.bytes == 0 {
+        True -> send_close(state, archive.closure(session))
+        False -> flush(state)
+      }
+    _ -> state
+  }
+}
+
+fn send_close(state: State, plan: archive.Closure) -> State {
+  case state.writer {
+    Some(writer) -> {
+      process.send(writer, worker.Close(plan, state.replies))
+      State(..state, archive: Closing(plan))
+    }
+    None -> state
+  }
+}
+
+/// Asynchronous mailbox barrier, sent by the registry after admission closes.
+/// Earlier appends from that registry precede this operation even after timeout.
+pub fn begin_drain(o: Owner) -> Result(Nil, Error) {
+  use permit <- result.try(admit(o))
+  process.send(o.subject, Request(permit, Drain))
+  Ok(Nil)
+}
+
+pub fn drained(o: Owner) -> Bool {
+  alive(o) && runtime.is_drained(o.gate)
 }

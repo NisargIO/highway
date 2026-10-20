@@ -5,6 +5,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
+import highway/secrets
 import highway/storage.{type Error, type Store}
 
 pub type Settings {
@@ -79,8 +80,8 @@ pub fn load() -> Result(Settings, String) {
   use bucket <- result.try(required("HIGHWAY_S3_BUCKET"))
   use prefix <- result.try(required("HIGHWAY_S3_PREFIX"))
   use region <- result.try(required("AWS_REGION"))
-  use access <- result.try(required("AWS_ACCESS_KEY_ID"))
-  use secret <- result.try(required("AWS_SECRET_ACCESS_KEY"))
+  use access <- result.try(secrets.required("AWS_ACCESS_KEY_ID"))
+  use secret <- result.try(secrets.required("AWS_SECRET_ACCESS_KEY"))
   let endpoint =
     envoy.get("HIGHWAY_S3_ENDPOINT")
     |> result.unwrap("https://s3." <> region <> ".amazonaws.com")
@@ -88,6 +89,7 @@ pub fn load() -> Result(Settings, String) {
     int.parse(envoy.get("HIGHWAY_S3_TIMEOUT_MS") |> result.unwrap("2000"))
     |> result.replace_error("invalid S3 timeout"),
   )
+  use session <- result.try(secrets.optional("AWS_SESSION_TOKEN"))
   validate(Settings(
     case string.ends_with(endpoint, "/") {
       True -> string.drop_end(endpoint, 1)
@@ -98,7 +100,10 @@ pub fn load() -> Result(Settings, String) {
     region,
     access,
     secret,
-    envoy.get("AWS_SESSION_TOKEN") |> result.unwrap(""),
+    case session {
+      Some(value) -> value
+      None -> ""
+    },
     timeout,
   ))
 }

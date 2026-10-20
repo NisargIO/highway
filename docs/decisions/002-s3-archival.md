@@ -1,5 +1,7 @@
 # Decision 002: S3 archival and recovery (storage format v1)
 
+Historical milestone 4 record. [Decision 004](004-production-operations.md) extends heads to v2 open/closed status, adds drain and active readiness; v1 segment/index formats and archival guarantees remain.
+
 Milestone 4 adds explicitly configured `s3_async` alongside the development memory adapter. Protocol version remains 1. This extends Decision 001; its memory guarantees still apply. WebSocket scrollback and the archive/live replay join remain milestone 5.
 
 ## Publication and recovery

@@ -4,7 +4,7 @@
 %% This slice only binds loopback TCP. Socket calls return safe OS reasons.
 -module(highway_runtime_ffi).
 -export([now/0, monotonic_ms/0, incarnation/0, slots/0, acquire/2, release/2,
-         socket_limits/1, close/2, permit/1, release_permit/2, reset/1, set_account/4, account/1, set_missing/2, is_missing/1, reserve_bytes/2, release_bytes/2, call/3, shutdown/1]).
+         socket_limits/1, close/2, permit/1, release_permit/2, reset/1, set_account/4, account/1, set_missing/2, is_missing/1, reserve_bytes/2, release_bytes/2, call/3, shutdown/1, set_drained/2, is_drained/1, memory_bytes/0]).
 now() -> erlang:system_time(second).
 monotonic_ms() -> erlang:monotonic_time(millisecond).
 incarnation() -> binary:encode_hex(crypto:strong_rand_bytes(16), lowercase).
@@ -91,3 +91,8 @@ call(Subject, Timeout, MakeRequest) ->
     end.
 flush_reply(Tag) -> receive {Tag, _} -> flush_reply(Tag) after 0 -> ok end.
 shutdown(Pid) -> exit(Pid, shutdown), nil.
+
+set_drained(T, B) -> ets:insert(T, {drained,B}), nil.
+is_drained(T) -> try ets:lookup(T, drained) of [{_,B}] -> B; [] -> false catch error:badarg -> false end.
+
+memory_bytes() -> erlang:memory(total).

@@ -99,6 +99,7 @@ pub fn open(
           None,
           domain.Cursor(incarnation, 1, 0),
           runtime.incarnation(),
+          False,
         )
       publish(store, scope, None, head)
     }
@@ -118,6 +119,7 @@ pub fn open(
           epoch: old.epoch + 1,
           index: Some(key),
           commit_id: id,
+          closed: False,
         )
       publish(store, scope, Some(object), next)
     }
@@ -149,6 +151,10 @@ fn validate_tip(store: Store, scope: String, head: Head) -> Result(Nil, Error) {
 }
 
 pub fn plan(base: Session, events: List(Event)) -> Result(Plan, Error) {
+  use _ <- result.try(case base.head.closed {
+    True -> Error(storage.Conflict)
+    False -> Ok(Nil)
+  })
   use first <- result.try(
     list.first(events) |> result.replace_error(storage.Corrupt("empty batch")),
   )
@@ -283,4 +289,26 @@ pub fn published_tip(
       }
     }
   }
+}
+
+/// Frozen closing plan. A close is authoritative only after head CAS or exact
+/// reconciliation; retries must retain this same commit identity.
+pub type Closure {
+  Closure(base: Session, next: Head)
+}
+
+pub fn closure(base: Session) -> Closure {
+  Closure(
+    base,
+    format.Head(..base.head, closed: True, commit_id: runtime.incarnation()),
+  )
+}
+
+pub fn close(store: Store, plan: Closure) -> Result(Session, Error) {
+  publish(
+    store,
+    plan.base.scope,
+    Some(storage.Object(format.head(plan.base.head), plan.base.etag)),
+    plan.next,
+  )
 }

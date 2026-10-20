@@ -15,6 +15,7 @@ check: prepare
 	gleam format --check src test
 	gleam check
 	gleam test
+	node --test sdk/javascript/test/*.test.mjs
 
 test: prepare
 	gleam test
@@ -37,3 +38,31 @@ s3-conformance: prepare
 
 s3-test-server:
 	python3 scripts/s3-test-server.py
+
+.PHONY: release sdk-test smoke-release image
+release: prepare
+	gleam export erlang-shipment
+
+sdk-test:
+	node --test sdk/javascript/test/*.test.mjs
+
+smoke-release: release
+	node examples/release-smoke.mjs
+
+image:
+	docker build -t highway:0.1.0 .
+
+.PHONY: sdk-check smoke-container benchmark
+sdk-check:
+	npm --prefix sdk/javascript ci --ignore-scripts
+	npm --prefix sdk/javascript run check
+	npm --prefix sdk/javascript test
+
+smoke-container: image
+	node examples/container-smoke.mjs
+
+benchmark: smoke-release
+
+.PHONY: proxy-check
+proxy-check:
+	node examples/proxy-smoke.mjs

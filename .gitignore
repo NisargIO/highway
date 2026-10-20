@@ -10,3 +10,6 @@ erl_crash.dump
 *.key
 /tmp
 /coverage
+
+**/node_modules/
+*.tgz

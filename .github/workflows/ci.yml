@@ -24,8 +24,20 @@ jobs:
         with:
           node-version: 22
       - run: make setup
+      - run: make sdk-check
       - run: make check
       - run: make smoke
       - run: make smoke-s3
+      - run: make smoke-release
       - name: Verify dependency lockfile
-        run: git diff --exit-code -- manifest.toml
+        run: git diff --exit-code -- manifest.toml sdk/javascript/package-lock.json
+
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: make smoke-container
+      - run: make proxy-check

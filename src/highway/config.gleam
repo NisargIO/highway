@@ -36,6 +36,14 @@ pub type StorageMode {
   S3(s3.Settings)
 }
 
+pub type Operational {
+  Operational(drain_ms: Int, probe_ms: Int, stale_ms: Int)
+}
+
+pub fn operational_defaults() -> Operational {
+  Operational(30_000, 5000, 15_000)
+}
+
 pub type Config {
   Config(
     bind: String,
@@ -44,6 +52,7 @@ pub type Config {
     origins: List(String),
     limits: Limits,
     storage: StorageMode,
+    operational: Operational,
   )
 }
 
@@ -158,17 +167,18 @@ pub fn load() -> Result(Config, String) {
     False -> Error("invalid port")
   })
   let bind = envoy.get("HIGHWAY_BIND") |> result.unwrap("127.0.0.1")
-  use _ <- result.try(case bind == "127.0.0.1" {
+  use _ <- result.try(case bind == "127.0.0.1" || bind == "0.0.0.0" {
     True -> Ok(Nil)
     False ->
       Error(
-        "current server requires loopback 127.0.0.1; production packaging is pending",
+        "bind must be 127.0.0.1 or explicit 0.0.0.0 behind a private TLS proxy",
       )
   })
   use limits <- result.try(load_limits())
   let origins = [
     envoy.get("HIGHWAY_ORIGIN") |> result.unwrap("http://localhost:3000"),
   ]
+  use operational <- result.try(load_operational())
   Ok(Config(
     bind,
     port,
@@ -176,6 +186,7 @@ pub fn load() -> Result(Config, String) {
     origins,
     limits,
     mode,
+    operational,
   ))
 }
 
@@ -285,4 +296,32 @@ fn load_limits() -> Result(Limits, String) {
       decode_limits(bytes)
     }
   }
+}
+
+fn load_operational() -> Result(Operational, String) {
+  use drain <- result.try(env_int("HIGHWAY_DRAIN_MS", 30_000))
+  use probe <- result.try(env_int("HIGHWAY_PROBE_MS", 5000))
+  use stale <- result.try(env_int("HIGHWAY_PROBE_STALE_MS", 15_000))
+  validate_operational(Operational(drain, probe, stale))
+}
+
+pub fn validate_operational(o: Operational) -> Result(Operational, String) {
+  case
+    o.drain_ms >= 100
+    && o.drain_ms <= 300_000
+    && o.probe_ms >= 100
+    && o.probe_ms <= 60_000
+    && o.stale_ms > o.probe_ms
+    && o.stale_ms <= 120_000
+  {
+    True -> Ok(o)
+    False -> Error("invalid drain/probe deadline settings")
+  }
+}
+
+fn env_int(name: String, default: Int) -> Result(Int, String) {
+  envoy.get(name)
+  |> result.unwrap(int.to_string(default))
+  |> int.parse
+  |> result.replace_error("invalid " <> name)
 }

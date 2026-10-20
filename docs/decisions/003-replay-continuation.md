@@ -1,5 +1,7 @@
 # Decision 003: bounded authorized replay and live continuation
 
+Historical milestone 5 record. [Decision 004](004-production-operations.md) adds production operations and head v2; replay/wire/index semantics described here remain.
+
 Status: implemented for milestone 5. Extends protocol v1's already specified subscription semantics and adds the explicit `replay_limit` error. Storage format v1 and existing cursors are unchanged. Decisions 001 and 002 describe earlier milestone behavior; this decision supersedes their replay-unavailable/cache-eviction limitations.
 
 ## Capture and join

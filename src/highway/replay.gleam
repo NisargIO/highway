@@ -2,6 +2,7 @@
 /// in flight; the factory additionally bounds concurrent jobs across the node.
 import exception
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
@@ -11,6 +12,8 @@ import gleam/string
 import highway/auth.{type Claims}
 import highway/config.{type Limits}
 import highway/domain.{type Cursor, type Error, type Stream}
+import highway/observability as logging
+import highway/operations
 import highway/owner.{type Owner}
 import highway/protocol
 import highway/replay/read
@@ -18,7 +21,6 @@ import highway/replay/view.{type View}
 import highway/runtime
 import highway/storage.{type Store}
 import highway/storage/archive
-import logging
 
 pub type Input {
   Input(
@@ -70,9 +72,19 @@ pub fn start(
   limits: Limits,
   io_slots: runtime.Slots,
 ) -> actor.StartResult(Launcher) {
+  start_operational(store, prefix, limits, io_slots, None)
+}
+
+pub fn start_operational(
+  store: Option(Store),
+  prefix: String,
+  limits: Limits,
+  io_slots: runtime.Slots,
+  metrics: Option(operations.Context),
+) -> actor.StartResult(Launcher) {
   let slots = runtime.slots()
   factory.worker_child(fn(input) {
-    start_job(input, store, prefix, limits, slots, io_slots)
+    start_job(input, store, prefix, limits, slots, io_slots, metrics)
   })
   |> factory.restart_strategy(supervision.Temporary)
   |> factory.start
@@ -119,11 +131,16 @@ fn start_job(
   limits: Limits,
   slots: runtime.Slots,
   io_slots: runtime.Slots,
+  metrics: Option(operations.Context),
 ) -> actor.StartResult(Pid) {
   actor.new_with_initialiser(1000, fn(subject) {
     case runtime.acquire(slots, limits.replay_workers) {
       False -> Error("replay_capacity")
       True -> {
+        case metrics {
+          Some(c) -> operations.activity(c, operations.Replay, True)
+          None -> Nil
+        }
         let pid = process.self()
         let _ =
           process.spawn(fn() {
@@ -155,6 +172,20 @@ fn start_job(
         domain.Unavailable
       })
       |> result.unwrap(Error(domain.Unavailable))
+    case metrics {
+      Some(c) -> operations.activity(c, operations.Replay, False)
+      None -> Nil
+    }
+    case outcome {
+      Ok(read.Ready(batch)) ->
+        operations.record(
+          metrics,
+          operations.ReplayItems,
+          list.length(batch.items),
+        )
+      Error(_) -> operations.record(metrics, operations.ReplayErrors, 1)
+      _ -> Nil
+    }
     process.send(
       input.reply,
       Reply(input.subscription, input.generation, outcome),

@@ -210,7 +210,7 @@ pub fn missing_s3_subscription_does_not_create_storage_or_poison_readiness_test(
   let reg = started.data
   let tenant = domain.Tenant("tenant")
   let stream = domain.Stream("events")
-  assert !registry.ready(reg)
+  // Readiness now probes storage independently of stream ownership.
   let assert Ok(_) =
     archive.open(fake.store, archive.scope("test", tenant, stream), True)
   let _ = wait_registry(reg, tenant, stream, 200)

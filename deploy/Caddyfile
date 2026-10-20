@@ -1,0 +1,11 @@
+# Run Caddy on the host. Only the WebSocket route is public; health, readiness
+# and Prometheus stay on Highway's private listener. Caddy terminates TLS.
+{$HIGHWAY_PUBLIC_HOST} {
+    @websocket path /v1/ws
+    handle @websocket {
+        reverse_proxy 127.0.0.1:4000
+    }
+    handle {
+        respond "Not found" 404
+    }
+}
