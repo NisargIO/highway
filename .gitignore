@@ -1,0 +1,12 @@
+*.beam
+*.ez
+/build
+erl_crash.dump
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/tmp
+/coverage
