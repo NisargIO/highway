@@ -19,7 +19,7 @@ const jwt = (stream, actions = ['publish', 'subscribe', 'history'], lifetime = 1
   return `${input}.${sign(null, Buffer.from(input), privateKey).toString('base64url')}`;
 };
 const children = [], clients = [], tasks = [], received = { a: [], b: [] }, persisted = { a: [], b: [] };
-let output = '', server, paused = false, bCalls = 0;
+let output = '', server, paused = false, bCalls = 0, bLifetime = 3;
 const launch = (cmd, args, env = {}) => {
   const child = spawn(cmd, args, { cwd: new URL('..', import.meta.url), detached: true, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   child.exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
@@ -66,7 +66,7 @@ try {
   const expected = { a: [await publish(pub, 'a', 'seed-a', { text: 'x'.repeat(24000) })], b: [await publish(pub, 'b', 'seed-b')] };
   await until(() => ['a', 'b'].every(s => persisted[s].includes(expected[s][0].cursor)), 'seed head commits');
   const a = await client.subscribe({ stream: 'a', from: 'earliest', window: 2, getToken: () => jwt('a', ['subscribe', 'history']) });
-  const b = await client.subscribe({ stream: 'b', from: 'earliest', window: 2, getToken: () => { bCalls++; return jwt('b', ['subscribe', 'history'], 3); } });
+  const b = await client.subscribe({ stream: 'b', from: 'earliest', window: 2, getToken: () => { bCalls++; return jwt('b', ['subscribe', 'history'], bLifetime); } });
   const aState = consume(a, received.a), bState = consume(b, received.b);
   await until(() => received.a.some(f => f.type === 'event') && received.b.some(f => f.type === 'event'), 'both streams replay on one socket');
   await assert.rejects(client.subscribe({ stream: 'b', from: 'earliest', getToken: () => jwt('a') }), { code: 'forbidden' });
@@ -75,6 +75,10 @@ try {
     await assert.rejects(client.subscribe({ stream: 'a', getToken: () => jwt('a', ['subscribe'], 120, ...identity) }), { code: 'forbidden' });
   }
   await until(() => bCalls >= 2, 'independent automatic refresh');
+  // Fast renewal is only for the refresh assertion. Restore normal timing
+  // before archive seeks: repeated refresh intentionally cancels in-flight
+  // scans, and a 300 ms cadence can exhaust the bounded replay deadline.
+  client.refreshMs = 25000; bLifetime = 120; await b.refresh();
   const fixed = jwt('a', ['subscribe', 'history'], 2);
   const expiring = await client.subscribe({ stream: 'a', from: 'latest', getToken: () => fixed });
   const expired = consume(expiring, []);
