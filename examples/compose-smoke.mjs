@@ -35,12 +35,12 @@ const deadline = async (promise, label) => {
   finally { clearTimeout(timer); }
 };
 function sdk() {
-  const client = new HighwayClient({ url: base.replace('http:', 'ws:') + '/v1/ws', getToken: () => token(stream), retryMs: 50 });
+  const client = new HighwayClient({ url: base.replace('http:', 'ws:') + '/v1/ws', retryMs: 50 });
   clients.push(client); return client;
 }
 async function publish(client, messageId) {
   for (let i = 0; i < 200; i++) {
-    try { return await client.publish({ stream, messageId, data: { sample: true } }); }
+    try { return await client.publish({ stream, messageId, data: { sample: true }, getToken: () => token(stream) }); }
     catch (error) { if (error.code !== 'unavailable') throw error; }
     await delay(30);
   }
@@ -67,7 +67,7 @@ try {
   await publisher.connect(); await subscriber.connect();
   const seed = await publish(publisher, 'seed');
   await until(() => progress.includes(seed.cursor), 'seed persistence');
-  const sub = await subscriber.subscribe({ stream, from: 'earliest', window: 8 });
+  const sub = await subscriber.subscribe({ stream, from: 'earliest', window: 8, getToken: () => token(stream) });
   tasks.push((async () => {
     try { for await (const frame of sub) received.push(frame); }
     catch (error) { if (error.code !== 'closed') faults.push(error.code || 'subscription failed'); }
@@ -100,8 +100,13 @@ try {
   // Restart the object store too: recovery must use the named volume, rather
   // than either process retaining its prior memory.
   await compose('stop', 'minio');
-  await compose('start', '--wait', 'minio');
-  await compose('start', '--wait', 'highway'); stopped = false;
+  await compose('start', 'minio');
+  await until(async () => {
+    try { return (await fetch(`${store}/minio/health/live`, { signal: AbortSignal.timeout(1000) })).ok; }
+    catch { return false; }
+  }, 'MinIO restart readiness');
+  await compose('start', 'highway');
+  await until(async () => await status('/readyz') === 200, 'Highway restart readiness'); stopped = false;
   await until(() => publisher.connected && subscriber.connected, 'SDK reconnect');
   const c = await publish(publisher, 'after-restart');
   await until(() => received.some(f => f.cursor === c.cursor), 'replay/live continuation after full restart');
@@ -110,7 +115,7 @@ try {
   const expected = [seed, a, b, c].map(f => f.cursor);
   assert.deepEqual(received.filter(f => f.type === 'event').map(f => f.cursor), expected, 'no skips or reordering across restart');
   const replay = sdk(); await replay.connect();
-  const finite = await replay.subscribe({ stream, from: 'earliest', follow: false, window: 2 });
+  const finite = await replay.subscribe({ stream, from: 'earliest', follow: false, window: 2, getToken: () => token(stream) });
   const archived = [];
   await deadline((async () => { for await (const frame of finite) if (frame.type === 'event') archived.push(frame.cursor); })(), 'bounded-credit finite replay');
   assert.deepEqual(archived, expected);

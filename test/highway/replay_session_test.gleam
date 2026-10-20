@@ -744,3 +744,127 @@ pub fn negative_monotonic_clock_still_starts_replay_test() {
   registry.stop(reg)
   fake.stop(f)
 }
+
+pub fn scoped_expiry_and_refresh_cancel_only_matching_replay_generation_test() {
+  let f = fake.new()
+  let #(_, _, plan) = seed(f)
+  let blocked = process.new_subject()
+  let key = support.key()
+  let cfg = settings(key)
+  let reg = start(cfg, blocking(f.store, plan.index_key, blocked))
+  let expiring =
+    support.token_for(key, "tenant", "user", 900, 1001, ["subscribe", "history"])
+  let lasting = support.token(key, ["subscribe", "history"])
+  let a =
+    session.handle(
+      session.new(0),
+      protocol.ScopedSubscribe(
+        "a",
+        "a",
+        domain.Stream("events"),
+        protocol.Earliest,
+        True,
+        10,
+        expiring,
+      ),
+      cfg,
+      reg,
+      1000,
+      0,
+    )
+  let waiting = session.tick(a.state, cfg, 1000, 1)
+  let assert Ok(#(worker, _)) = process.receive(blocked, 2000)
+  let monitor = observe_down(worker)
+  let assert Ok(s) = dict.get(waiting.state.subscriptions, "a")
+  let assert Some(job) = s.job
+  let both =
+    session.handle(
+      waiting.state,
+      protocol.ScopedSubscribe(
+        "b",
+        "b",
+        domain.Stream("events"),
+        protocol.Latest,
+        True,
+        10,
+        lasting,
+      ),
+      cfg,
+      reg,
+      1000,
+      1,
+    )
+  let expired = session.tick(both.state, cfg, 1001, 2)
+  let assert Ok(_) = process.selector_receive(monitor, 1000)
+  assert !dict.has_key(expired.state.subscriptions, "a")
+  assert dict.has_key(expired.state.subscriptions, "b")
+  assert expired.close == None
+  let stale =
+    replay.Reply(
+      "a",
+      replay.generation(job),
+      Ok(read.Ready(read.Batch([read.Boundary(s.cursor, 2)], s.cursor))),
+    )
+  let ignored = session.replayed(expired.state, stale, cfg, 1001, 3)
+  assert ignored.responses == []
+  let assert Ok(event) =
+    registry.publish(
+      reg,
+      domain.Tenant("tenant"),
+      domain.Stream("events"),
+      "still-live",
+      json.null(),
+    )
+  let live = session.tick(ignored.state, cfg, 1001, 4)
+  assert list.contains(
+    live.responses,
+    protocol.EventMessage("b", domain.Stream("events"), event),
+  )
+  session.cleanup(live.state)
+  // A same-grant refresh cancels blocked I/O too. Old queued replies must not
+  // return payload or erase the replacement credential before a new scan.
+  let a =
+    session.handle(
+      session.new(0),
+      protocol.ScopedSubscribe(
+        "a",
+        "a",
+        domain.Stream("events"),
+        protocol.Earliest,
+        True,
+        10,
+        lasting,
+      ),
+      cfg,
+      reg,
+      1000,
+      5,
+    )
+  let waiting = session.tick(a.state, cfg, 1000, 6)
+  let assert Ok(#(worker, _)) = process.receive(blocked, 2000)
+  let monitor = observe_down(worker)
+  let assert Ok(s) = dict.get(waiting.state.subscriptions, "a")
+  let assert Some(job) = s.job
+  let refreshed =
+    session.handle(
+      waiting.state,
+      protocol.SubscriptionAuth("r", "a", lasting),
+      cfg,
+      reg,
+      1000,
+      7,
+    )
+  let assert Ok(_) = process.selector_receive(monitor, 1000)
+  let stale =
+    replay.Reply(
+      "a",
+      replay.generation(job),
+      Ok(read.Ready(read.Batch([read.Boundary(s.cursor, 2)], s.cursor))),
+    )
+  let ignored = session.replayed(refreshed.state, stale, cfg, 1000, 8)
+  assert ignored.responses == []
+  assert ignored.state.subscriptions == refreshed.state.subscriptions
+  session.cleanup(ignored.state)
+  registry.stop(reg)
+  fake.stop(f)
+}

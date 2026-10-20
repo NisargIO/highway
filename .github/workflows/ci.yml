@@ -29,6 +29,7 @@ jobs:
       - run: make smoke
       - run: make smoke-s3
       - run: make smoke-release
+      - run: make smoke-scoped
       - name: Verify dependency lockfile
         run: git diff --exit-code -- manifest.toml sdk/javascript/package-lock.json
 

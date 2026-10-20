@@ -1,0 +1,33 @@
+# Decision 005: independently authorized subscriptions on one socket
+
+Status: implemented protocol v2 extension and JavaScript SDK 0.2.0. Protocol v1 remains supported. Delivery, cursor, head/index/segment formats and singleton ownership are unchanged.
+
+## Problem and choice
+
+A connection-wide JWT requires the issuer to combine every stream grant into one token. Refresh replaces that whole token and its expiry closes the socket. Applications issuing separate stream JWTs need to multiplex them without one subscription inheriting another's authority or lifetime.
+
+The existing hello retains `version: 1` and advertises `supported_versions: [1,2]`. A client selects v2 explicitly on each JWT-bearing command. V2 `subscribe` carries its own `token`; `subscription_auth` refreshes only that subscription. Successful replies include version 2, subject, tenant and expiry. No separate socket JWT is required. One socket keeps a fixed subject and tenant, pinned by its first verified authorized v2 operation. All later tokens, including after reconnect in the SDK, must match. Cross-tenant or cross-subject multiplexing is not supported.
+
+V1 connection auth and v2 scoped auth cannot be mixed on one socket. A v1 token is never an implicit fallback for a scoped command. A v2 JWT with multiple grants authorizes only its explicit operation/subscription; grants are never unioned across scopes. JWT signatures, issuer/audience/time/key checks continue through the existing JOSE verifier. Raw JWTs are not retained by the server or logged.
+
+## Authorization lifecycle
+
+A subscription retains only its verified claims. Subscribe, ACK, memory delivery, each replay read and completed-result delivery check that subscription's current authority. Earliest/after require History throughout; latest retains its existing exclusive access floor. A valid refresh missing required grants cancels only that view; invalid replacement signatures leave the old server lease unchanged until its original expiry. Refresh cancels active I/O and invalidates queued generations before replacing claims, retaining delivered credit/cursor order. An expired lease cannot be resurrected by racing the timer; create a new authorized subscription from the processed cursor.
+
+The bounded socket tick expires scopes independently, cancels their jobs, releases owner leases, and removes expired completion receipts. Other scopes continue. Finite receipts retain their originating claims until expiry/eviction and never borrow a sibling's token. V2 unsubscribe is idempotent cleanup, including after expiry/completion, and requires no new token. Transport loss, owner failure or drain can still affect the whole socket as before.
+
+The original unauthenticated deadline remains: a v2 client must successfully authorize an operation within five seconds of upgrade. Invalid attempts do not extend it. After first authorization the connection idle deadline remains, and each active subscription refresh supplies activity. A v2 SDK `connect()` means transport readiness; it does not assert any stream access.
+
+V2 publish carries an explicit JWT per command, separately checked for Publish. It does not reuse subscription credentials. A publisher's persisted-progress watch retains the most recent successful publish's claims and expires with them; a separately authorized live subscription can independently permit progress for that stream. There is no automatic renewal of publisher-only watches, offline publish queue, or automatic publish retry. A long outage can outlive the JWT and its persistence notices; authorized history remains the reconciliation path. Acceptance still means bounded memory, and persistence still requires the authoritative head commit.
+
+## Bounds and SDK behavior
+
+All scopes share the existing connection byte/credit budget, 16-item tick, single active replay job, node replay workers and 64-subscription/watch limits. Completion receipts remain bounded by count and cursor positions. Tokens are at most 16,000 bytes. Auth/subscribe/refresh frames are at most 16 KiB; a first scoped publish can use the normal 256 KiB frame and 64 KiB payload limits.
+
+SDK 0.2.0 selects v2 when the client constructor omits `getToken`; each subscribe/publish then requires its own callback. `sub.refresh()` refreshes just that view, with automatic renewal before expiry and at most every 25 seconds. Provider waits are bounded/abortable; refresh is single-flight per view. Expiry, provider failures and authorization rejection end only the affected iterator and clear its buffered frames. A scoped subscribe/refresh request timeout cancels that server view, rather than resetting the socket merely for an uncertain scope. Connection loss aborts provider work, discards stale completions and fetches fresh tokens independently for exclusive processed-cursor resume, so one stalled provider cannot block healthy scopes from authenticating. Late successful scoped responses after timeout are ignored using monotonic generated request IDs without a growing tombstone set; ordered unsubscribe prevents orphan view resurrection. Sent publish uncertainty remains explicit and never triggers retry.
+
+Providing the constructor's default `getToken` keeps the original v1 behavior/API, including connection-wide refresh and expiry. Passing per-operation credentials in that mode is rejected, rather than ignored. Scoped clients refuse servers without advertised v2 support. No endpoint or storage migration is required, and old clients continue to see a v1 hello; new scoped clients require the updated server. SDK/image publication is separate from local implementation.
+
+## Verification
+
+Focused Gleam tests cover independently expiring streams, wrong-stream/tenant/subject rejection, refresh isolation and History removal, expired-lease resurrection attempts, publisher-watch expiry, blocked replay cancellation, stale generations and v2 codec boundaries. SDK tests cover per-scope callbacks, refresh/expiry/revocation isolation, aborting stale providers on reconnect, timeout cleanup, bounded publisher provider work, and refusal to mix or silently downgrade modes. `make smoke-scoped` runs actual SDK clients against the native shipment/S3 fixture: two JWTs share one socket, a large first scoped publish works, one extra view expires/revokes without affecting siblings, live delivery precedes head commits, and both streams survive drain/restart with exact replay. `make compose-smoke` additionally exercises v2 through real MinIO signatures, preconditions, outages and both-service restart. Existing v1 smokes remain compatibility checks.

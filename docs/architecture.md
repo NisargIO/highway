@@ -110,6 +110,9 @@ Temporary supervised replay jobs are limited to one per connection and eight per
 
 ## Authentication
 
+Protocol v2 additionally supports independently issued JWTs per subscription on one socket. Each view retains its own claims, refreshes/expires independently, and cancels only its own replay work when revoked. The first valid authorized operation pins subject and tenant; later scopes must match. Publish carries its own JWT. Scopes share all existing connection/replay bounds and never union grants. Constructor-level SDK credentials retain v1 connection auth for compatibility; modes cannot be mixed. See [Decision 005](decisions/005-scoped-stream-auth.md).
+
+
 The application backend is the token issuer. Start with one configured issuer and audience, a locally configured verification key set keyed by `kid`, and one explicitly configured asymmetric signing algorithm, preferably EdDSA after library validation. JOSE 1.11.12 and a small typed Erlang binding implement strict EdDSA verification in this slice. No custom cryptographic implementation.
 
 Require a valid signature, issuer, audience, subject, expiry, issued-at policy, and tenant. Validate `nbf` when present, enforce maximum token age/lifetime and bounded clock skew, reject `none`, algorithm confusion, and unknown keys. Token input cannot select a remote key URL. Exact stream grants separately authorize `publish`, `subscribe`, and `history`; live access does not implicitly grant old history.

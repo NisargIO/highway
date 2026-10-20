@@ -82,3 +82,7 @@ compose-token:
 
 compose-smoke: compose-up
 	node examples/compose-smoke.mjs
+
+.PHONY: smoke-scoped
+smoke-scoped: release
+	node examples/scoped-smoke.mjs

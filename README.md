@@ -33,6 +33,28 @@ The [JavaScript SDK](sdk/javascript/README.md) supports Node.js 22+ and browsers
 
 `make smoke-release` runs the real native shipment and SDK through drain/restart/replay and writes `build/benchmark.json`. [Local measurements and their limits](docs/benchmarks.md) include a deliberately small 64-record pending cap; defaults are not production throughput promises.
 
+## Independent stream tokens
+
+The SDK can share a socket across independently authorized subscriptions:
+
+```js
+const client = new HighwayClient({ url: 'wss://streams.example.com/v1/ws' });
+const sub = await client.subscribe({
+  stream: 'events',
+  getToken: () => getStreamJwt('events'), // your backend, fresh on renewal
+  from: 'earliest',
+  follow: true,
+  window: 16,
+});
+const other = await client.subscribe({
+  stream: 'notifications',
+  getToken: () => getStreamJwt('notifications'),
+  from: 'latest',
+});
+```
+
+Use `sub.refresh()` to refresh one view explicitly; automatic refresh and expiry are independent. All tokens on the socket must share subject/tenant. Earliest/after need subscribe and history grants. Publish similarly takes its own `getToken` callback. This is the explicit [protocol v2 extension](docs/decisions/005-scoped-stream-auth.md), implemented in SDK 0.2.0; constructor-level `getToken` still selects the compatible v1 connection-auth API. `make smoke-scoped` reproduces multi-stream JWT isolation, expiry/refresh, live-before-head and ordered restart/resume; `make compose-smoke` uses v2 with real MinIO.
+
 ## Replay and continue live
 
 After authentication, subscribe with history permission:
@@ -55,7 +77,7 @@ export HIGHWAY_JWT_AUDIENCE=highway
 make run
 ```
 
-Storage mode must be selected explicitly; missing/unknown modes fail startup. `HIGHWAY_BIND` defaults to `127.0.0.1`; explicit `0.0.0.0` is supported behind a private TLS proxy, and `HIGHWAY_PORT` defaults to `4000`. Browser Origin must equal `HIGHWAY_ORIGIN` (default `http://localhost:3000`); native clients without Origin still require JWT authentication. Query strings are rejected on `/v1/ws`; send tokens only in an `auth` frame.
+Storage mode must be selected explicitly; missing/unknown modes fail startup. `HIGHWAY_BIND` defaults to `127.0.0.1`; explicit `0.0.0.0` is supported behind a private TLS proxy, and `HIGHWAY_PORT` defaults to `4000`. Browser Origin must equal `HIGHWAY_ORIGIN` (default `http://localhost:3000`); native clients without Origin still require JWT authentication. Query strings are rejected on `/v1/ws`; send tokens only in JWT-bearing protocol frames (v1 `auth`, or v2 scoped commands).
 
 `GET /healthz` returns 200. Memory readiness stays 503. S3 readiness requires a fresh successful read/write canary probe and available storage/admission capacity, even before the first stream. It becomes 503 during drain, stale/failed probes, owner degradation or full admission capacity. `/metrics` exposes fixed node-level Prometheus counters/gauges on the private listener. `/v1/ws` advertises the selected mode and `durable: false`: live acceptance never promises durability.
 

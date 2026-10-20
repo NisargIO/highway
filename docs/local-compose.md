@@ -10,7 +10,7 @@ make compose-smoke
 Setup generates random storage credentials and an Ed25519 development issuer in ignored `build/compose/`, builds the images, initializes the private `highway` bucket, and waits for storage readiness. The first source build downloads Go dependencies and takes longer than later cached starts. The repeatable two-client smoke leaves the stack running and checks:
 
 - Real SigV4, wrong-signature rejection, opaque ETags, read visibility, conditional create/update and concurrent-create conformance through Highway's Gleam adapter.
-- JWT-authenticated SDK publish/subscribe and denied anonymous object reads.
+- Protocol v2 per-operation JWT SDK publish/subscribe and denied anonymous object reads.
 - Paused MinIO with immediate ordered live delivery, retained pending capacity, no false `persisted`, and liveness/readiness transitions.
 - Confirmed authoritative heads, graceful drain/closed v2 heads, and restart of **both** processes using the named volume.
 - Exclusive SDK resume through a fresh epoch/discontinuity and exact finite replay with a credit window of two.
@@ -69,3 +69,5 @@ Community MinIO is archived/unmaintained and distributes source only; the former
 Local validation uses Linux arm64 containers on OrbStack; CI is also configured for Linux amd64. Images and SDK remain unpublished. A single-disk Docker volume is not replication, backup, AWS certification or a production durability guarantee. HTTPS and production IAM are separate in [deployment.md](deployment.md).
 
 The smoke also runs locally with Node 22.23.3. A failed upgrade in that runtime can emit `error` without `close`; the SDK detaches on transport error or handshake timeout, schedules one reconnect, ignores late callbacks, and retains uncertain publish semantics. Regression tests cover opening failures, silent timeouts, stale callbacks, processed-cursor resume and no publish retry.
+
+The Node/browser examples now place `getToken` on each subscription/publish (SDK 0.2.0, protocol v2). `make smoke-scoped` separately reproduces two stream JWTs sharing one socket, independent expiry/refresh/revocation and restart/resume against the deterministic S3 fixture. The real MinIO smoke uses v2 as well.

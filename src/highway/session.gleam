@@ -35,15 +35,26 @@ pub type Subscription {
     retry_ms: Int,
     held_bytes: Int,
     target: domain.Cursor,
+    scoped_claims: Option(Claims),
   )
 }
 
 pub type Watch {
-  Watch(owner: Owner, through: Option(domain.Cursor), publisher: Bool)
+  Watch(
+    owner: Owner,
+    through: Option(domain.Cursor),
+    publisher: Bool,
+    scoped_claims: Option(Claims),
+  )
 }
 
 pub type Receipt {
-  Receipt(stream: Stream, credit: flow.Credit, historical: Bool)
+  Receipt(
+    stream: Stream,
+    credit: flow.Credit,
+    historical: Bool,
+    scoped_claims: Option(Claims),
+  )
 }
 
 type AckTarget {
@@ -54,6 +65,7 @@ type AckTarget {
 pub type State {
   State(
     claims: Option(Claims),
+    identity: Option(#(String, domain.Tenant)),
     subscriptions: Dict(String, Subscription),
     started_ms: Int,
     last_input_ms: Int,
@@ -69,7 +81,17 @@ pub type Step {
 }
 
 pub fn new(now: Int) -> State {
-  State(None, dict.new(), now, now, 0, dict.new(), process.new_subject(), [])
+  State(
+    None,
+    None,
+    dict.new(),
+    now,
+    now,
+    0,
+    dict.new(),
+    process.new_subject(),
+    [],
+  )
 }
 
 fn success(state: State, responses: List(Response)) -> Step {
@@ -96,8 +118,9 @@ pub fn deadline(
   ms: Int,
 ) -> Option(Error) {
   case state.claims {
-    None if ms - state.started_ms >= config.limits.auth_ms ->
-      Some(domain.Unauthenticated)
+    None
+      if state.identity == None && ms - state.started_ms >= config.limits.auth_ms
+    -> Some(domain.Unauthenticated)
     Some(c) if now >= c.expires_at -> Some(domain.TokenExpired)
     _ if ms - state.last_input_ms >= config.limits.idle_ms ->
       Some(domain.Unavailable)
@@ -134,6 +157,41 @@ fn command_step(
   now: Int,
 ) -> Step {
   case cmd {
+    protocol.ScopedSubscribe(id, sub, stream, from, follow, window, token) ->
+      scoped_command(
+        state,
+        protocol.Subscribe(id, sub, stream, from, follow, window),
+        token,
+        config,
+        registry,
+        now,
+      )
+    protocol.ScopedPublish(id, stream, message, data, token) ->
+      scoped_command(
+        state,
+        protocol.Publish(id, stream, message, data),
+        token,
+        config,
+        registry,
+        now,
+      )
+    protocol.SubscriptionAuth(id, sub, token) ->
+      refresh_subscription(state, id, sub, token, config, now)
+    protocol.Unsubscribe(id, sub) if state.identity != None -> {
+      case dict.get(state.subscriptions, sub) {
+        Ok(s) -> close_sub(s)
+        Error(_) -> Nil
+      }
+      let state =
+        State(
+          ..state,
+          subscriptions: dict.delete(state.subscriptions, sub),
+          completed: list.filter(state.completed, fn(pair) { pair.0 != sub }),
+        )
+      success(prune_watches(state, now), [protocol.Unsubscribed(id, sub)])
+    }
+    protocol.Auth(id, _) if state.identity != None ->
+      failure(state, id, "", domain.Forbidden)
     protocol.Auth(id, token) ->
       case auth.verify(config.auth, token, now) {
         Error(e) ->
@@ -191,7 +249,6 @@ fn command_step(
                       receipt_allowed(claims, pair.1, now) == Ok(Nil)
                     }),
                   ),
-                  claims,
                   now,
                 ),
                 [
@@ -210,9 +267,9 @@ fn command_step(
       }
     _ ->
       case state.claims {
-        None -> failure(state, command_id(cmd), "", domain.Unauthenticated)
+        None -> scoped_control(state, cmd, config, registry, now)
         Some(claims) ->
-          authorized_command(state, cmd, claims, config, registry, now)
+          authorized_command(state, cmd, claims, config, registry, now, None)
       }
   }
 }
@@ -224,6 +281,7 @@ fn authorized_command(
   config: Config,
   registry: Registry,
   now: Int,
+  scoped_claims: Option(Claims),
 ) -> Step {
   case cmd {
     protocol.Publish(id, stream, message, data) -> {
@@ -250,11 +308,25 @@ fn authorized_command(
             config.DevelopmentMemory -> state
             config.S3(_) ->
               case registry.find(registry, claims.tenant, stream) {
-                Ok(#(o, _)) -> watch(state, stream, o, True)
+                Ok(#(o, _)) -> watch(state, stream, o, True, scoped_claims)
                 Error(_) -> state
               }
           }
-          success(state, [protocol.Accepted(id, stream, event)])
+          let frame = case scoped_claims {
+            None -> protocol.Accepted(id, stream, event)
+            Some(c) -> {
+              let domain.Tenant(tenant) = c.tenant
+              protocol.ScopedAccepted(
+                id,
+                stream,
+                event,
+                c.subject,
+                tenant,
+                c.expires_at,
+              )
+            }
+          }
+          success(state, [frame])
         }
         Error(e) -> failure(state, id, "", e)
       }
@@ -313,6 +385,7 @@ fn authorized_command(
               state.last_input_ms,
               0,
               captured.high,
+              scoped_claims,
             )
           let state =
             State(
@@ -320,10 +393,25 @@ fn authorized_command(
               completed: list.filter(state.completed, fn(pair) { pair.0 != sub }),
             )
           let state = case config.storage {
-            config.S3(_) if follow -> watch(state, stream, o, False)
+            config.S3(_) if follow -> watch(state, stream, o, False, None)
             _ -> state
           }
-          let frames = [protocol.Subscribed(id, sub, captured.high)]
+          let frames = [
+            case scoped_claims {
+              None -> protocol.Subscribed(id, sub, captured.high)
+              Some(c) -> {
+                let domain.Tenant(tenant) = c.tenant
+                protocol.ScopedSubscribed(
+                  id,
+                  sub,
+                  captured.high,
+                  c.subject,
+                  tenant,
+                  c.expires_at,
+                )
+              }
+            },
+          ]
           let frames = case s.caught_up {
             True -> list.append(frames, [protocol.CaughtUp(sub, captured.high)])
             False -> frames
@@ -423,13 +511,20 @@ fn authorized_command(
             }
           }
       }
-    protocol.Auth(_, _) -> failure(state, "", "", domain.Internal)
+    protocol.Auth(_, _)
+    | protocol.ScopedPublish(_, _, _, _, _)
+    | protocol.ScopedSubscribe(_, _, _, _, _, _, _)
+    | protocol.SubscriptionAuth(_, _, _) ->
+      failure(state, "", "", domain.Internal)
   }
 }
 
 fn command_id(cmd: Command) -> String {
   case cmd {
     protocol.Auth(id, _)
+    | protocol.ScopedPublish(id, _, _, _, _)
+    | protocol.ScopedSubscribe(id, _, _, _, _, _, _)
+    | protocol.SubscriptionAuth(id, _, _)
     | protocol.Publish(id, _, _, _)
     | protocol.Subscribe(id, _, _, _, _, _)
     | protocol.Unsubscribe(id, _) -> id
@@ -440,102 +535,119 @@ fn command_id(cmd: Command) -> String {
 pub fn tick(state: State, config: Config, now: Int, ms: Int) -> Step {
   case deadline(state, config, now, ms) {
     Some(e) -> disconnect(state, e, 1008)
-    None ->
-      case state.claims {
-        None -> success(state, [])
-        Some(claims) -> {
-          // One turn produces at most 16 events. No unbounded mailbox fanout,
-          // per-subscriber payload backlog, or per-tick output list.
-          let entries = dict.to_list(state.subscriptions)
-          let start = case list.length(entries) {
-            0 -> 0
-            n -> state.rotation % n
+    None -> {
+      // One turn produces at most 16 events. No unbounded mailbox fanout,
+      // per-subscriber payload backlog, or per-tick output list.
+      let state =
+        State(
+          ..state,
+          completed: list.filter(state.completed, fn(pair) {
+            case subscription_claims(state, pair.1.scoped_claims) {
+              Ok(claims) -> receipt_allowed(claims, pair.1, now) == Ok(Nil)
+              Error(_) -> False
+            }
+          }),
+        )
+      let entries = dict.to_list(state.subscriptions)
+      let start = case list.length(entries) {
+        0 -> 0
+        n -> state.rotation % n
+      }
+      let #(front, back) = list.split(entries, start)
+      let entries = list.append(back, front)
+      let initial = #(State(..state, rotation: start + 1), [], 16, None)
+      let #(state, frames, _, close) =
+        list.fold(entries, initial, fn(acc, entry) {
+          let #(id, sub) = entry
+          let #(state, frames, budget, close) = acc
+          let authorized = {
+            use claims <- result.try(subscription_claims(
+              state,
+              sub.scoped_claims,
+            ))
+            use _ <- result.try(allowed(claims, sub, now))
+            Ok(claims)
           }
-          let #(front, back) = list.split(entries, start)
-          let entries = list.append(back, front)
-          let initial = #(State(..state, rotation: start + 1), [], 16, None)
-          let #(state, frames, _, close) =
-            list.fold(entries, initial, fn(acc, entry) {
-              let #(id, sub) = entry
-              let #(state, frames, budget, close) = acc
-              case allowed(claims, sub, now) {
-                Error(e) -> {
-                  close_sub(sub)
+          case authorized {
+            Error(e) -> {
+              close_sub(sub)
+              #(
+                State(
+                  ..state,
+                  subscriptions: dict.delete(state.subscriptions, id),
+                ),
+                [protocol.Failure("", id, e), ..frames],
+                budget,
+                close,
+              )
+            }
+            Ok(claims) -> {
+              let #(updated, produced, remaining, fatal) =
+                pump(
+                  sub,
+                  id,
+                  config,
+                  ms,
+                  budget,
+                  connection_bytes(state),
+                  [],
+                  claims,
+                  now,
+                  state.replies,
+                  !dict.fold(state.subscriptions, False, fn(busy, _, other) {
+                    busy || other.job != None
+                  }),
+                )
+              let complete =
+                list.any(produced, fn(frame) { frame == protocol.Complete(id) })
+              let #(subs, receipts) = case updated {
+                Some(s) if complete -> {
+                  close_sub(s)
+                  let receipts =
+                    list.append(
+                      list.filter(state.completed, fn(pair) { pair.0 != id }),
+                      [
+                        #(
+                          id,
+                          Receipt(
+                            s.stream,
+                            s.credit,
+                            s.view.historical,
+                            s.scoped_claims,
+                          ),
+                        ),
+                      ],
+                    )
                   #(
-                    State(
-                      ..state,
-                      subscriptions: dict.delete(state.subscriptions, id),
-                    ),
-                    [protocol.Failure("", id, e), ..frames],
-                    budget,
-                    close,
+                    dict.delete(state.subscriptions, id),
+                    bound_receipts(receipts),
                   )
                 }
-                Ok(_) -> {
-                  let #(updated, produced, remaining, fatal) =
-                    pump(
-                      sub,
-                      id,
-                      config,
-                      ms,
-                      budget,
-                      connection_bytes(state),
-                      [],
-                      claims,
-                      now,
-                      state.replies,
-                      !dict.fold(state.subscriptions, False, fn(busy, _, other) {
-                        busy || other.job != None
-                      }),
-                    )
-                  let complete =
-                    list.any(produced, fn(frame) {
-                      frame == protocol.Complete(id)
-                    })
-                  let #(subs, receipts) = case updated {
-                    Some(s) if complete -> {
-                      close_sub(s)
-                      let receipts =
-                        list.append(
-                          list.filter(state.completed, fn(pair) { pair.0 != id }),
-                          [
-                            #(
-                              id,
-                              Receipt(s.stream, s.credit, s.view.historical),
-                            ),
-                          ],
-                        )
-                      #(
-                        dict.delete(state.subscriptions, id),
-                        bound_receipts(receipts),
-                      )
-                    }
-                    Some(s) -> #(
-                      dict.insert(state.subscriptions, id, s),
-                      state.completed,
-                    )
-                    None -> {
-                      close_sub(sub)
-                      #(dict.delete(state.subscriptions, id), state.completed)
-                    }
-                  }
-                  #(
-                    State(..state, subscriptions: subs, completed: receipts),
-                    list.append(produced, frames),
-                    remaining,
-                    option.or(fatal, close),
-                  )
+                Some(s) -> #(
+                  dict.insert(state.subscriptions, id, s),
+                  state.completed,
+                )
+                None -> {
+                  close_sub(sub)
+                  #(dict.delete(state.subscriptions, id), state.completed)
                 }
               }
-            })
-          let step = progress(state, claims, now)
-          Step(
-            step.state,
-            list.append(list.reverse(frames), step.responses),
-            option.or(close, step.close),
-          )
-        }
-      }
+              #(
+                State(..state, subscriptions: subs, completed: receipts),
+                list.append(produced, frames),
+                remaining,
+                option.or(fatal, close),
+              )
+            }
+          }
+        })
+      let step = progress(state, now)
+      Step(
+        step.state,
+        list.append(list.reverse(frames), step.responses),
+        option.or(close, step.close),
+      )
+    }
   }
 }
 
@@ -887,14 +999,18 @@ pub fn replayed(
   case deadline(state, config, now, ms) {
     Some(e) -> disconnect(state, e, 1008)
     None ->
-      case dict.get(state.subscriptions, reply.subscription), state.claims {
-        Ok(s), Some(claims) ->
+      case dict.get(state.subscriptions, reply.subscription) {
+        Ok(s) ->
           case s.job {
             Some(job) ->
               case replay.generation(job) == reply.generation {
                 False -> success(state, [])
                 True -> {
                   let outcome = {
+                    use claims <- result.try(subscription_claims(
+                      state,
+                      s.scoped_claims,
+                    ))
                     use _ <- result.try(allowed(claims, s, now))
                     use step <- result.try(reply.result)
                     case step {
@@ -992,7 +1108,7 @@ pub fn replayed(
               }
             None -> success(state, [])
           }
-        _, _ -> success(state, [])
+        Error(_) -> success(state, [])
       }
   }
 }
@@ -1015,50 +1131,65 @@ fn watch_capacity(
   }
 }
 
-fn watch(state: State, stream: Stream, o: Owner, publisher: Bool) -> State {
+fn watch(
+  state: State,
+  stream: Stream,
+  o: Owner,
+  publisher: Bool,
+  scoped_claims: Option(Claims),
+) -> State {
   let previous =
-    dict.get(state.watches, stream) |> result.unwrap(Watch(o, None, False))
+    dict.get(state.watches, stream)
+    |> result.unwrap(Watch(o, None, False, None))
   State(
     ..state,
     watches: dict.insert(
       state.watches,
       stream,
-      Watch(o, previous.through, previous.publisher || publisher),
+      Watch(
+        o,
+        previous.through,
+        previous.publisher || publisher,
+        case publisher {
+          True -> scoped_claims
+          False -> previous.scoped_claims
+        },
+      ),
     ),
   )
 }
 
-fn watch_allowed(
-  state: State,
-  claims: Claims,
-  stream: Stream,
-  w: Watch,
-  now: Int,
-) -> Bool {
-  let publishing =
-    w.publisher
-    && auth.authorize(claims, claims.tenant, stream, domain.Publish, now)
-    == Ok(Nil)
+fn watch_allowed(state: State, stream: Stream, w: Watch, now: Int) -> Bool {
+  let publishing = case subscription_claims(state, w.scoped_claims) {
+    Ok(claims) ->
+      w.publisher
+      && auth.authorize(claims, claims.tenant, stream, domain.Publish, now)
+      == Ok(Nil)
+    Error(_) -> False
+  }
   let subscribed =
     dict.fold(state.subscriptions, False, fn(yes, _, s) {
-      yes || s.stream == stream
+      yes
+      || s.stream == stream
+      && case subscription_claims(state, s.scoped_claims) {
+        Ok(claims) -> allowed(claims, s, now) == Ok(Nil)
+        Error(_) -> False
+      }
     })
-    && auth.authorize(claims, claims.tenant, stream, domain.Subscribe, now)
-    == Ok(Nil)
   publishing || subscribed
 }
 
-fn prune_watches(state: State, claims: Claims, now: Int) -> State {
+fn prune_watches(state: State, now: Int) -> State {
   State(
     ..state,
     watches: dict.filter(state.watches, fn(stream, w) {
-      watch_allowed(state, claims, stream, w, now)
+      watch_allowed(state, stream, w, now)
     }),
   )
 }
 
-fn progress(state: State, claims: Claims, now: Int) -> Step {
-  let state = prune_watches(state, claims, now)
+fn progress(state: State, now: Int) -> Step {
+  let state = prune_watches(state, now)
   dict.fold(state.watches, success(state, []), fn(step, stream, w) {
     case owner.alive(w.owner) {
       False -> Step(step.state, step.responses, Some(1011))
@@ -1091,6 +1222,7 @@ fn receipt_allowed(
   receipt: Receipt,
   now: Int,
 ) -> Result(Nil, Error) {
+  let claims = option.unwrap(receipt.scoped_claims, claims)
   use _ <- result.try(auth.authorize(
     claims,
     claims.tenant,
@@ -1115,5 +1247,177 @@ fn bound_receipts(
   case list.length(receipts) > 64 || pending > 1024 {
     True -> bound_receipts(list.drop(receipts, 1))
     False -> receipts
+  }
+}
+
+/// Explicit scope claims win; only v1 sessions have connection claims to use.
+fn subscription_claims(
+  state: State,
+  scoped: Option(Claims),
+) -> Result(Claims, Error) {
+  case scoped, state.claims {
+    Some(claims), _ -> Ok(claims)
+    None, Some(claims) -> Ok(claims)
+    _, _ -> Error(domain.Unauthenticated)
+  }
+}
+
+fn verify_scoped(
+  state: State,
+  token: String,
+  cfg: Config,
+  now: Int,
+) -> Result(Claims, Error) {
+  use _ <- result.try(case state.claims {
+    Some(_) -> Error(domain.Forbidden)
+    None -> Ok(Nil)
+  })
+  use claims <- result.try(auth.verify(cfg.auth, token, now))
+  let verified_identity = #(claims.subject, claims.tenant)
+  case state.identity {
+    Some(identity) if identity != verified_identity -> Error(domain.Forbidden)
+    _ -> Ok(claims)
+  }
+}
+
+fn scoped_command(
+  state: State,
+  cmd: Command,
+  token: String,
+  cfg: Config,
+  reg: Registry,
+  now: Int,
+) -> Step {
+  let id = command_id(cmd)
+  let sub = case cmd {
+    protocol.Subscribe(_, sub, _, _, _, _) -> sub
+    _ -> ""
+  }
+  let request = case cmd {
+    protocol.Publish(_, stream, _, _) -> Ok(#(stream, domain.Publish, False))
+    protocol.Subscribe(_, _, stream, from, _, _) ->
+      Ok(#(stream, domain.Subscribe, from != protocol.Latest))
+    _ -> Error(domain.Internal)
+  }
+  let outcome = {
+    use #(stream, action, historical) <- result.try(request)
+    use claims <- result.try(verify_scoped(state, token, cfg, now))
+    use _ <- result.try(auth.authorize(
+      claims,
+      claims.tenant,
+      stream,
+      action,
+      now,
+    ))
+    use _ <- result.try(case historical {
+      True -> auth.authorize(claims, claims.tenant, stream, domain.History, now)
+      False -> Ok(Nil)
+    })
+    Ok(claims)
+  }
+  case outcome {
+    Error(e) -> failure(state, id, sub, e)
+    Ok(claims) ->
+      authorized_command(
+        State(..state, identity: Some(#(claims.subject, claims.tenant))),
+        cmd,
+        claims,
+        cfg,
+        reg,
+        now,
+        Some(claims),
+      )
+  }
+}
+
+fn scoped_control(
+  state: State,
+  cmd: Command,
+  cfg: Config,
+  reg: Registry,
+  now: Int,
+) -> Step {
+  let sub = case cmd {
+    protocol.Ack(sub, _) | protocol.Unsubscribe(_, sub) -> sub
+    _ -> ""
+  }
+  let credentials = case dict.get(state.subscriptions, sub) {
+    Ok(s) -> subscription_claims(state, s.scoped_claims)
+    Error(_) -> {
+      use receipt <- result.try(
+        list.find(state.completed, fn(pair) { pair.0 == sub })
+        |> result.replace_error(domain.Unauthenticated),
+      )
+      subscription_claims(state, receipt.1.scoped_claims)
+    }
+  }
+  case credentials {
+    Ok(claims) -> authorized_command(state, cmd, claims, cfg, reg, now, None)
+    Error(e) -> failure(state, command_id(cmd), sub, e)
+  }
+}
+
+fn refresh_subscription(
+  state: State,
+  id: String,
+  sub: String,
+  token: String,
+  cfg: Config,
+  now: Int,
+) -> Step {
+  let outcome = {
+    use s <- result.try(
+      dict.get(state.subscriptions, sub)
+      |> result.replace_error(domain.InvalidFrame),
+    )
+    use claims <- result.try(verify_scoped(state, token, cfg, now))
+    // An already expired lease cannot be resurrected by racing its idle tick.
+    use old <- result.try(subscription_claims(state, s.scoped_claims))
+    use _ <- result.try(allowed(old, s, now))
+    Ok(#(s, claims))
+  }
+  case outcome {
+    Error(e) -> failure(state, id, sub, e)
+    Ok(#(s, claims)) ->
+      case allowed(claims, s, now) {
+        Error(e) -> {
+          close_sub(s)
+          let state =
+            State(
+              ..state,
+              subscriptions: dict.delete(state.subscriptions, sub),
+              completed: list.filter(state.completed, fn(pair) { pair.0 != sub }),
+            )
+          failure(prune_watches(state, now), id, sub, e)
+        }
+        Ok(_) -> {
+          cancel_job(s)
+          let updated =
+            Subscription(
+              ..s,
+              scoped_claims: Some(claims),
+              job: None,
+              buffer: [],
+              scan: None,
+              held_bytes: 0,
+            )
+          let domain.Tenant(tenant) = claims.tenant
+          success(
+            State(
+              ..state,
+              subscriptions: dict.insert(state.subscriptions, sub, updated),
+            ),
+            [
+              protocol.SubscriptionAuthenticated(
+                id,
+                sub,
+                claims.subject,
+                tenant,
+                claims.expires_at,
+              ),
+            ],
+          )
+        }
+      }
   }
 }

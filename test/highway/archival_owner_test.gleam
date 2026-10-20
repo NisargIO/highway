@@ -1,3 +1,4 @@
+import gleam/dict
 import gleam/erlang/process
 import gleam/json
 import gleam/option.{None, Some}
@@ -272,3 +273,73 @@ fn suspend(pid: process.Pid) -> Nil
 
 @external(erlang, "highway_test_crypto_ffi", "resume")
 fn resume(pid: process.Pid) -> Nil
+
+pub fn scoped_publisher_expiry_cannot_receive_committed_progress_test() {
+  let f = fake.new()
+  let key = support.key()
+  let cfg = support.config(key)
+  let cfg =
+    config.Config(
+      ..cfg,
+      storage: config.S3(s3.Settings(
+        "http://127.0.0.1:1",
+        "test",
+        "test",
+        "us-east-1",
+        "test",
+        "test",
+        "",
+        1000,
+      )),
+    )
+  let assert Ok(started) =
+    registry.start_storage(
+      registry.registration(),
+      cfg.limits,
+      Some(f.store),
+      "test",
+    )
+  let tenant = domain.Tenant("tenant")
+  let stream = domain.Stream("events")
+  let assert Ok(_) =
+    archive.open(f.store, archive.scope("test", tenant, stream), True)
+  let o = wait_registry(started.data, tenant, stream, 200)
+  let short = support.token_for(key, "tenant", "user", 900, 1001, ["publish"])
+  let accepted =
+    session.handle(
+      session.new(0),
+      protocol.ScopedPublish("p", stream, "m", json.null(), short),
+      cfg,
+      started.data,
+      1000,
+      0,
+    )
+  let assert [protocol.ScopedAccepted(_, _, event, _, _, _)] =
+    accepted.responses
+  let _ = wait_progress(o, event.cursor.offset, 200)
+  let expired = session.tick(accepted.state, cfg, 1001, 1)
+  assert expired.responses == []
+  assert expired.close == None
+  assert dict.size(expired.state.watches) == 0
+  let renewed =
+    session.handle(
+      expired.state,
+      protocol.ScopedPublish(
+        "q",
+        stream,
+        "next",
+        json.null(),
+        support.token(key, ["publish"]),
+      ),
+      cfg,
+      started.data,
+      1001,
+      2,
+    )
+  let assert [protocol.ScopedAccepted(_, _, event, _, _, _)] = renewed.responses
+  let _ = wait_progress(o, event.cursor.offset, 200)
+  assert session.tick(renewed.state, cfg, 1001, 3).responses
+    == [protocol.Persisted(stream, event.cursor)]
+  registry.stop(started.data)
+  fake.stop(f)
+}

@@ -16,7 +16,7 @@ pub fn canonical_lossless_cursor_fixture_test() {
 pub fn explicit_command_boundaries_test() {
   assert protocol.decode("{}") == Error(domain.InvalidFrame)
   assert protocol.decode("{\"type\":\"wat\"}") == Error(domain.UnknownCommand)
-  assert protocol.decode("{\"type\":\"publish\",\"version\":2}")
+  assert protocol.decode("{\"type\":\"publish\",\"version\":3}")
     == Error(domain.UnsupportedVersion)
   assert protocol.decode(
       "{\"type\":\"publish\",\"id\":\"p\",\"stream\":\"events\",\"message_id\":\"m\"}",
@@ -54,4 +54,56 @@ pub fn nested_payload_and_response_encoding_test() {
   )
   assert !string.contains(protocol.encode(protocol.Hello(5000)), "persisted")
   assert json.to_string(data) == "[true,null,{\"nested\":[1,2.5,\"hi\"]}]"
+}
+
+pub fn versioned_scoped_jwt_commands_and_capability_advertisement_test() {
+  let assert Ok(protocol.ScopedSubscribe(
+    "s",
+    "s",
+    domain.Stream("events"),
+    protocol.Earliest,
+    True,
+    128,
+    "jwt",
+  )) =
+    protocol.decode(
+      "{\"version\":2,\"type\":\"subscribe\",\"id\":\"s\",\"subscription\":\"s\",\"stream\":\"events\",\"from\":\"earliest\",\"token\":\"jwt\"}",
+    )
+  assert protocol.decode(
+      "{\"version\":2,\"type\":\"subscribe\",\"id\":\"s\",\"subscription\":\"s\",\"stream\":\"events\"}",
+    )
+    == Error(domain.InvalidFrame)
+  assert protocol.decode(
+      "{\"version\":2,\"type\":\"subscription_auth\",\"id\":\"r\",\"subscription\":\"s\",\"token\":\"jwt\"}",
+    )
+    == Ok(protocol.SubscriptionAuth("r", "s", "jwt"))
+  assert protocol.decode(
+      "{\"version\":1,\"type\":\"subscription_auth\",\"id\":\"r\",\"subscription\":\"s\",\"token\":\"jwt\"}",
+    )
+    == Error(domain.InvalidFrame)
+  assert string.contains(
+    protocol.encode(protocol.Hello(5000)),
+    "\"supported_versions\":[1,2]",
+  )
+  assert string.contains(
+    protocol.encode(protocol.SubscriptionAuthenticated(
+      "r",
+      "s",
+      "user",
+      "tenant",
+      1100,
+    )),
+    "\"version\":2",
+  )
+}
+
+pub fn scoped_controls_accept_explicit_v2_without_connection_credentials_test() {
+  assert protocol.decode(
+      "{\"version\":2,\"type\":\"ack\",\"subscription\":\"s\",\"through\":\"v1:abc:1:1\"}",
+    )
+    == Ok(protocol.Ack("s", domain.Cursor("abc", 1, 1)))
+  assert protocol.decode(
+      "{\"version\":2,\"type\":\"unsubscribe\",\"id\":\"u\",\"subscription\":\"s\"}",
+    )
+    == Ok(protocol.Unsubscribe("u", "s"))
 }

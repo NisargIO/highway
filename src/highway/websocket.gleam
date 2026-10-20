@@ -136,18 +136,23 @@ pub fn handle(
                 connection,
               )
             mist.Text(frame) -> {
-              let limit = case state.session.claims {
-                None -> 16_384
-                Some(_) -> 262_144
-              }
-              let step = case string.byte_size(frame) > limit {
+              let step = case string.byte_size(frame) > 262_144 {
                 True ->
                   session.disconnect(state.session, domain.FrameTooLarge, 1009)
                 False ->
                   case protocol.decode(frame) {
                     Error(e) -> session.disconnect(state.session, e, 1008)
-                    Ok(protocol.Auth(id, token)) ->
-                      case string.byte_size(frame) > 16_384 {
+                    Ok(cmd) -> {
+                      let auth_frame = case cmd {
+                        protocol.Auth(_, _)
+                        | protocol.ScopedSubscribe(_, _, _, _, _, _, _)
+                        | protocol.SubscriptionAuth(_, _, _) -> True
+                        protocol.ScopedPublish(_, _, _, _, _) -> False
+                        _ ->
+                          state.session.claims == None
+                          && state.session.identity == None
+                      }
+                      case auth_frame && string.byte_size(frame) > 16_384 {
                         True ->
                           session.disconnect(
                             state.session,
@@ -157,22 +162,14 @@ pub fn handle(
                         False ->
                           session.handle(
                             state.session,
-                            protocol.Auth(id, token),
+                            cmd,
                             config,
                             registry,
                             runtime.now(),
                             runtime.monotonic_ms(),
                           )
                       }
-                    Ok(cmd) ->
-                      session.handle(
-                        state.session,
-                        cmd,
-                        config,
-                        registry,
-                        runtime.now(),
-                        runtime.monotonic_ms(),
-                      )
+                    }
                   }
               }
               apply(state, step, connection)

@@ -12,3 +12,14 @@ for await (const f of s) {
 try { await c.publish({ stream: 'events', messageId: 'm', data: null }); }
 catch (error) { if (error instanceof PublishUncertainError) error.messageId.toUpperCase(); }
 c.close();
+
+const scoped = new HighwayClient({ url: 'wss://stream.example.com/v1/ws' });
+const getToken = async ({ signal }: { signal: AbortSignal }) => {
+  const response = await fetch('/api/stream-token', { method: 'POST', signal });
+  return (await response.json() as { token: string }).token;
+};
+const scopedSub = await scoped.subscribe<{ text: string }>({ stream: 'events', getToken, from: 'earliest' });
+const refreshed = await scopedSub.refresh();
+refreshed.expires_at.toFixed();
+await scoped.publish({ stream: 'events', messageId: 'scoped', data: null, getToken });
+scoped.close();

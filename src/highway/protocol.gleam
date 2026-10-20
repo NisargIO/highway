@@ -4,6 +4,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
+import gleam/string
 import highway/domain.{type Cursor, type Error, type Event, type Stream, Stream}
 
 pub type From {
@@ -13,6 +14,23 @@ pub type From {
 }
 
 pub type Command {
+  ScopedPublish(
+    id: String,
+    stream: Stream,
+    message_id: String,
+    data: json.Json,
+    token: String,
+  )
+  ScopedSubscribe(
+    id: String,
+    subscription: String,
+    stream: Stream,
+    from: From,
+    follow: Bool,
+    window: Int,
+    token: String,
+  )
+  SubscriptionAuth(id: String, subscription: String, token: String)
   Auth(id: String, token: String)
   Publish(id: String, stream: Stream, message_id: String, data: json.Json)
   Subscribe(
@@ -28,6 +46,29 @@ pub type Command {
 }
 
 pub type Response {
+  ScopedSubscribed(
+    id: String,
+    subscription: String,
+    high_watermark: Cursor,
+    subject: String,
+    tenant: String,
+    expires_at: Int,
+  )
+  ScopedAccepted(
+    id: String,
+    stream: Stream,
+    event: Event,
+    subject: String,
+    tenant: String,
+    expires_at: Int,
+  )
+  SubscriptionAuthenticated(
+    id: String,
+    subscription: String,
+    subject: String,
+    tenant: String,
+    expires_at: Int,
+  )
   Hello(auth_timeout_ms: Int)
   S3Hello(auth_timeout_ms: Int)
   Persisted(stream: Stream, through: Cursor)
@@ -98,28 +139,48 @@ fn from_decoder() -> decode.Decoder(From) {
   )
 }
 
+fn token_decoder() -> decode.Decoder(String) {
+  use token <- decode.then(decode.string)
+  case token != "" && string.byte_size(token) <= 16_000 {
+    True -> decode.success(token)
+    False -> decode.failure("", "JWT of 1..16000 bytes")
+  }
+}
+
 fn command() -> decode.Decoder(Command) {
   use version <- decode.optional_field("version", 1, decode.int)
   use kind <- decode.field("type", decode.string)
   case version, kind {
-    1, "ack" -> {
+    v, "ack" if v == 1 || v == 2 -> {
       use sub <- decode.field("subscription", name())
       use c <- decode.field("through", cursor_decoder())
       decode.success(Ack(sub, c))
+    }
+    2, "subscription_auth" -> {
+      use id <- decode.field("id", name())
+      use sub <- decode.field("subscription", name())
+      use token <- decode.field("token", token_decoder())
+      decode.success(SubscriptionAuth(id, sub, token))
     }
     1, "auth" -> {
       use id <- decode.field("id", name())
       use token <- decode.field("token", decode.string)
       decode.success(Auth(id, token))
     }
-    1, "publish" -> {
+    v, "publish" if v == 1 || v == 2 -> {
       use id <- decode.field("id", name())
       use stream <- decode.field("stream", name())
       use message <- decode.field("message_id", name())
       use data <- decode.field("data", json_value())
-      decode.success(Publish(id, Stream(stream), message, data))
+      case v {
+        2 -> {
+          use token <- decode.field("token", token_decoder())
+          decode.success(ScopedPublish(id, Stream(stream), message, data, token))
+        }
+        _ -> decode.success(Publish(id, Stream(stream), message, data))
+      }
     }
-    1, "subscribe" -> {
+    v, "subscribe" if v == 1 || v == 2 -> {
       use id <- decode.field("id", name())
       use sub <- decode.field("subscription", name())
       use stream <- decode.field("stream", name())
@@ -128,18 +189,33 @@ fn command() -> decode.Decoder(Command) {
       use window <- decode.optional_field("window", 128, decode.int)
       case window > 0 && window <= 1024 {
         True ->
-          decode.success(Subscribe(
-            id,
-            sub,
-            Stream(stream),
-            from,
-            follow,
-            window,
-          ))
+          case v {
+            2 -> {
+              use token <- decode.field("token", token_decoder())
+              decode.success(ScopedSubscribe(
+                id,
+                sub,
+                Stream(stream),
+                from,
+                follow,
+                window,
+                token,
+              ))
+            }
+            _ ->
+              decode.success(Subscribe(
+                id,
+                sub,
+                Stream(stream),
+                from,
+                follow,
+                window,
+              ))
+          }
         False -> decode.failure(Auth("", ""), "window between 1 and 1024")
       }
     }
-    1, "unsubscribe" -> {
+    v, "unsubscribe" if v == 1 || v == 2 -> {
       use id <- decode.field("id", name())
       use sub <- decode.field("subscription", name())
       decode.success(Unsubscribe(id, sub))
@@ -158,11 +234,18 @@ pub fn decode(frame: String) -> Result(Command, Error) {
     |> result.replace_error(domain.InvalidFrame),
   )
   case header {
-    #(v, _) if v != 1 -> Error(domain.UnsupportedVersion)
+    #(v, _) if v != 1 && v != 2 -> Error(domain.UnsupportedVersion)
     #(_, kind) ->
       case
         list.contains(
-          ["auth", "publish", "subscribe", "ack", "unsubscribe"],
+          [
+            "auth",
+            "publish",
+            "subscribe",
+            "ack",
+            "unsubscribe",
+            "subscription_auth",
+          ],
           kind,
         )
       {
@@ -176,9 +259,37 @@ pub fn decode(frame: String) -> Result(Command, Error) {
 
 pub fn encode(response: Response) -> String {
   let fields = case response {
+    ScopedSubscribed(id, sub, c, subject, tenant, expires) ->
+      identity(subject, tenant, expires)
+      |> list.append([
+        #("version", json.int(2)),
+        #("type", json.string("subscribed")),
+        #("id", json.string(id)),
+        #("subscription", json.string(sub)),
+        #("high_watermark", json.string(domain.cursor_string(c))),
+      ])
+    ScopedAccepted(id, Stream(stream), event, subject, tenant, expires) ->
+      identity(subject, tenant, expires)
+      |> list.append([
+        #("version", json.int(2)),
+        #("type", json.string("accepted")),
+        #("id", json.string(id)),
+        #("stream", json.string(stream)),
+        #("cursor", json.string(domain.cursor_string(event.cursor))),
+        #("message_id", json.string(event.message_id)),
+      ])
+    SubscriptionAuthenticated(id, sub, subject, tenant, expires) ->
+      identity(subject, tenant, expires)
+      |> list.append([
+        #("version", json.int(2)),
+        #("type", json.string("subscription_authenticated")),
+        #("id", json.string(id)),
+        #("subscription", json.string(sub)),
+      ])
     Hello(timeout) -> [
       #("type", json.string("hello")),
       #("version", json.int(1)),
+      #("supported_versions", json.array([1, 2], json.int)),
       #("auth_timeout_ms", json.int(timeout)),
       #("storage", json.string("development_memory")),
       #("durable", json.bool(False)),
@@ -186,6 +297,7 @@ pub fn encode(response: Response) -> String {
     S3Hello(timeout) -> [
       #("type", json.string("hello")),
       #("version", json.int(1)),
+      #("supported_versions", json.array([1, 2], json.int)),
       #("auth_timeout_ms", json.int(timeout)),
       #("storage", json.string("s3_async")),
       #("durable", json.bool(False)),
@@ -260,4 +372,16 @@ pub fn encode(response: Response) -> String {
     ]
   }
   json.object(fields) |> json.to_string
+}
+
+fn identity(
+  subject: String,
+  tenant: String,
+  expires: Int,
+) -> List(#(String, json.Json)) {
+  [
+    #("subject", json.string(subject)),
+    #("tenant", json.string(tenant)),
+    #("expires_at", json.int(expires)),
+  ]
 }

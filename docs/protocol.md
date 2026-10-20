@@ -1,13 +1,49 @@
 # Highway WebSocket protocol
 
-Protocol v1 implements authenticated publishing, earliest/after/latest replay and live continuation, and confirmed S3 persistence progress on `/v1/ws`. Select explicit `development_memory` or `s3_async`. S3 interrupted epochs produce ordered discontinuity frames during replay; memory scrollback lasts only for the current owner incarnation. Use UTF-8 JSON text frames with one command or server message per frame. Production connections use `wss://`; loopback development may use `ws://`.
+Protocols v1 and v2 implement authenticated publishing, earliest/after/latest replay and live continuation, and confirmed S3 persistence progress on `/v1/ws`. Select explicit `development_memory` or `s3_async`. S3 interrupted epochs produce ordered discontinuity frames during replay; memory scrollback lasts only for the current owner incarnation. Use UTF-8 JSON text frames with one command or server message per frame. Production connections use `wss://`; loopback development may use `ws://`.
 
-## Connection and authentication
+## Independent stream JWTs (protocol v2)
+
+Use v2 to put independently issued JWTs on subscriptions sharing one socket. Hello keeps `version: 1` for existing clients and advertises `supported_versions: [1,2]`. Send an explicit `version: 2` on scoped subscribe, refresh and publish. No initial connection `auth` is needed. The first successful authorized operation pins subject/tenant for the socket; every subsequent JWT must match. Different stream grants/expiry times are independent, and grants are never combined across subscriptions. V1 connection auth and v2 scoped auth cannot be mixed.
+
+```json
+{"version":2,"type":"subscribe","id":"s1","subscription":"events-view","stream":"events","token":"<JWT granting events subscribe/history>","from":"earliest","follow":true,"window":16}
+```
+
+```json
+{"version":2,"type":"subscribed","id":"s1","subscription":"events-view","high_watermark":"v1:s_abc:7:42","subject":"user_123","tenant":"team_123","expires_at":1792454400}
+```
+
+A second subscription can carry a different JWT for another exact stream on this same connection. Refresh one view with:
+
+```json
+{"version":2,"type":"subscription_auth","id":"r1","subscription":"events-view","token":"<replacement JWT>"}
+```
+
+```json
+{"version":2,"type":"subscription_authenticated","id":"r1","subscription":"events-view","subject":"user_123","tenant":"team_123","expires_at":1792454500}
+```
+
+Each view uses its own current verified claims for delivery, replay, results and ACKs. Earliest/after keep requiring History. Valid refreshes that remove required grants cancel that view; invalid signatures do not extend or replace the old server lease. Refresh cancels old replay work/buffers before replacing claims. Expiry emits `error` with that subscription ID and `token_expired`, releases its work/credit and leaves other views connected. An expired lease cannot be revived by racing refresh; recreate from a processed cursor. Bounded completed ACK receipts retain their own claims and expire independently. ACK/event/boundary/caught-up/complete frames use the existing shapes; ACK/unsubscribe also accept explicit `version: 2`; `unsubscribe` is idempotent cleanup in v2, including after expiry/completion.
+
+V2 publish supplies its own token; it never borrows a subscription's credentials:
+
+```json
+{"version":2,"type":"publish","id":"p1","stream":"events","token":"<JWT granting events publish>","message_id":"msg_001","data":{"text":"hello"}}
+```
+
+Its accepted reply adds `version: 2`, `subject`, `tenant`, and `expires_at` to the existing accepted fields. Publisher progress watches retain the latest successful publish's claims and expire with that JWT. A valid subscription can independently permit progress for the same stream. The SDK does not automatically renew publisher-only watches or retry publishes; if an outage outlasts the token, reconcile through authorized history. Accepted/persisted and authoritative head semantics are unchanged.
+
+The first authorized operation must succeed within the original five-second auth deadline, even if a client considers the transport connected. Invalid attempts do not extend it. Per-view refresh then supplies application activity; the ordinary connection idle deadline remains. All scopes share existing byte/credit/mailbox/replay limits, including one replay job per connection and at most 16 output items per tick. JWTs are at most 16,000 bytes; scoped subscribe/refresh/auth frames remain capped at 16 KiB. First scoped publish frames use normal 256 KiB/64 KiB payload limits.
+
+See [Decision 005](decisions/005-scoped-stream-auth.md) for lifecycle, compatibility and limits. The remaining delivery examples apply to both versions; the next section describes retained v1 connection authentication.
+
+## Connection authentication (protocol v1)
 
 The server sends `hello` after upgrade. Within five seconds the client sends `auth` with a signed JWT. No publish, subscription, or history operation is permitted beforehand. Limit every authentication frame to 16 KiB, independently of application payload limits. Browser Origin must exactly match `HIGHWAY_ORIGIN` (default `http://localhost:3000`). Native clients without Origin still require JWTs. The backend is loopback/private behind a TLS proxy; explicit wildcard binding is available for private containers. Reject query strings on the WebSocket route.
 
 ```json
-{"type":"hello","version":1,"auth_timeout_ms":5000,"storage":"development_memory","durable":false}
+{"type":"hello","version":1,"supported_versions":[1,2],"auth_timeout_ms":5000,"storage":"development_memory","durable":false}
 ```
 
 ```json
