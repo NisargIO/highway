@@ -168,3 +168,37 @@ test('a reconnect during application processing does not yield its unacked item 
   assert(next.sent.some(f => f.type === 'ack' && f.through === 'processing'));
   c.close();
 });
+
+test('error without close recovers once and ignores stale transport callbacks', async () => {
+  const c = client(); let disconnected = 0;
+  c.on('disconnected', () => disconnected++);
+  const sub = await c.subscribe({ stream: 'events', subscription: 's', window: 2 });
+  const old = Socket.all[0]; old.frame(event('processed')); await sub.next(); sub.ack('processed');
+  const uncertain = c.publish({ stream: 'events', messageId: 'sent-before-error', data: null });
+  // Reproduce an implementation that never emits close, even from close().
+  old.close = () => {};
+  old.dispatchEvent(new Event('error'));
+  await assert.rejects(uncertain, { code: 'publish_uncertain' });
+  await until(() => Socket.all.length === 2 && c.connected && Socket.all[1].sent.some(f => f.type === 'subscribe'));
+  const next = Socket.all[1];
+  assert.deepEqual(next.sent.find(f => f.type === 'subscribe').from, { after: 'processed' });
+  assert.equal(next.sent.filter(f => f.type === 'publish').length, 0);
+  old.dispatchEvent(new Event('error')); old.dispatchEvent(new Event('close'));
+  await delay(20);
+  assert.equal(Socket.all.length, 2); assert.equal(disconnected, 1); assert(c.connected);
+  next.frame(event('continued')); assert.equal((await sub.next()).value.cursor, 'continued');
+  c.close();
+});
+
+test('failed initial upgrade and silent handshake timeout recover without close', async () => {
+  for (const failure of ['error', 'timeout']) {
+    const c = client({ requestTimeoutMs: 20 });
+    const ready = c.connect(), failed = Socket.all[0];
+    // Suppress the queued hello so the socket stays in its opening handshake.
+    failed.frame = () => {}; failed.close = () => {};
+    if (failure === 'error') failed.dispatchEvent(new Event('error'));
+    await ready;
+    assert.equal(Socket.all.length, 2); assert(c.connected);
+    c.close();
+  }
+});

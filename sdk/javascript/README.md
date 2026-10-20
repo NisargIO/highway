@@ -95,6 +95,8 @@ Subject and tenant stay fixed for one client instance across refresh and reconne
 
 Reconnect delay backs off to five seconds. There is no offline publish queue. Incoming frames are capped at 256 KiB. Each subscription queues at most its window plus 16 control frames, within the shared byte cap. Exhaustion cancels that subscription with `slow_consumer`, rather than discarding events. Pending commands and transport buffering also reject overload explicitly. Concurrent calls to an iterator's `next()` are rejected. The application's own retained objects/checkpoint storage are outside these limits.
 
+Transport errors and handshake deadlines detach the failed socket and start one reconnect even if the WebSocket implementation never emits `close` (including failed upgrades in Node 22). Later callbacks from that socket are ignored. A sent publish still fails as `publish_uncertain` and is never replayed.
+
 Events: `connected`, `disconnected`, `reconnecting`, `accepted`, `persisted`, `caughtUp`, `subscriptionError`, `error`. `on(name, callback)` returns an unsubscribe function. Listener exceptions are isolated; callbacks should handle application errors themselves. Use the async iterator for processing/credit rather than an unbounded event-handler backlog. The [browser example](../../examples/browser/index.html) shares this SDK and keeps at most 40 preview rows.
 
 ## Verification

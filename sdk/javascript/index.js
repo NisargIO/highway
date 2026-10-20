@@ -54,17 +54,7 @@ export class HighwayClient {
     try { ws = new this.WebSocket(this.url); } catch { this._retry(); return; }
     this._ws = ws; this._authAbort = new AbortController();
     const valid = () => this._ws === ws && epoch === this._epoch;
-    this._handshake = setTimeout(() => { if (valid()) ws.close(1000, 'Authentication timeout'); }, this.requestTimeoutMs);
-    ws.addEventListener('message', e => {
-      if (!valid()) return;
-      try {
-        if (typeof e.data !== 'string' || bytes(e.data) > 262_144) throw new HighwayError('invalid_frame');
-        const frame = JSON.parse(e.data);
-        this._frame(frame, epoch);
-      } catch (error) { const safe = error instanceof HighwayError ? error : new HighwayError('invalid_frame'); this._emit('error', safe); this._terminate(safe); }
-    });
-    ws.addEventListener('error', () => { /* close carries the transport outcome */ });
-    ws.addEventListener('close', e => {
+    const disconnect = code => {
       if (!valid()) return;
       clearTimeout(this._handshake); clearTimeout(this._refreshTimer);
       this._authAbort.abort();
@@ -74,8 +64,27 @@ export class HighwayClient {
         this._pending.delete(id);
       }
       for (const sub of this._subscriptions.values()) sub._pause();
-      this._emit('disconnected', { code: e.code }); this._retry();
+      this._emit('disconnected', { code }); this._retry();
+    };
+    const fail = () => {
+      if (!valid()) return;
+      // Node 22's native WebSocket can emit only error on failed upgrades,
+      // leaving readyState CONNECTING and never emitting close. Detach first
+      // so an eventual close/error cannot schedule a second reconnect.
+      disconnect(1006);
+      try { ws.close(); } catch { /* Already detached; transport cleanup only. */ }
+    };
+    this._handshake = setTimeout(fail, this.requestTimeoutMs);
+    ws.addEventListener('message', e => {
+      if (!valid()) return;
+      try {
+        if (typeof e.data !== 'string' || bytes(e.data) > 262_144) throw new HighwayError('invalid_frame');
+        const frame = JSON.parse(e.data);
+        this._frame(frame, epoch);
+      } catch (error) { const safe = error instanceof HighwayError ? error : new HighwayError('invalid_frame'); this._emit('error', safe); this._terminate(safe); }
     });
+    ws.addEventListener('error', fail);
+    ws.addEventListener('close', e => disconnect(e.code));
   }
   _retry() {
     if (this._closed) return;
