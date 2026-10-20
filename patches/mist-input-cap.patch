@@ -1,0 +1,38 @@
+--- a/build/packages/mist/src/mist/internal/websocket.gleam
++++ b/build/packages/mist/src/mist/internal/websocket.gleam
+@@ -131,6 +131,17 @@
+       )
+     case msg {
+       Valid(SocketMessage(data)) -> {
++        // Highway: cap input before frame decoding.
++        case bit_array.byte_size(state.buffer) + bit_array.byte_size(data) > 262_144 {
++          True -> {
++            case transport.send(transport, socket, websocket.encode_close_frame(websocket.CustomCloseReason(1009, <<>>), None)) {
++              Ok(_) -> Nil
++              Error(_) -> logging.log(logging.Warning, "Failed to send oversized frame close")
++            }
++            on_close(state.user)
++            actor.stop()
++          }
++          False -> {
+         let #(frames, rest) =
+           websocket.decode_many_frames(
+             <<state.buffer:bits, data:bits>>,
+@@ -190,6 +201,8 @@
+           actor.stop_abnormal("WebSocket received a malformed message")
+         })
+       }
++        }
++        }
+       Valid(UserMessage(msg)) -> {
+         exception.rescue(fn() { handler(state.user, User(msg), connection) })
+         |> result.map(fn(cont) {
+@@ -321,7 +334,7 @@
+         websocket.encode_pong_frame(payload, None),
+       )
+       |> result.map(fn(_nil) {
+-        set_active(connection.transport, connection.socket)
++        // Highway: rearm active-once only after the complete batch.
+         apply_frames(rest, handler, connection, continue, on_close)
+       })
+       |> result.lazy_unwrap(fn() {

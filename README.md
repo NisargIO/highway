@@ -1,46 +1,98 @@
 # Highway
 
-Highway is a planned Gleam service for publishing and subscribing to named streams over WebSockets. Signed JWT capabilities grant access to individual streams. Messages travel live immediately; S3 stores their history asynchronously for scrollback and reconnects.
+Highway is a Gleam/OTP service for authorized live streams over WebSockets. Application backends issue signed JWT capabilities for exact tenant/stream actions. One owner orders each stream, and live delivery does not wait for storage.
 
-**Status: repository bootstrap.** The HTTP server and CI are implemented. JWT verification, WebSockets, stream actors, and S3 persistence are planned. A live acceptance response will not mean a message is durable: a crash can lose the unpersisted tail.
+**Status: milestones 1–5 implemented locally.** Authenticated live streams now support explicit `development_memory` and `s3_async` storage. S3 writes immutable batches/indexes, conditionally commits the authoritative head, and allocates fresh durable epochs on recovery. Only confirmed head commits produce `persisted`; `accepted` remains admission to bounded memory and a crash can lose its pending tail. Authorized earliest/after replay joins committed history, pending memory, and later live events on one subscription, including interrupted epochs. Real AWS conformance is opt-in and has not been run in this session.
 
-## Run locally
+## Run the demonstration
 
-Use the toolchain in `.tool-versions`: Gleam 1.19.2, Erlang/OTP 29.1.2, and rebar3 3.27.3. On macOS, `brew install gleam erlang rebar3` installs the tools; use a version manager if Homebrew has newer releases.
+Use the versions in `.tool-versions` (Gleam 1.19.2, Erlang/OTP 29.1.2, rebar3 3.27.3), Python 3, `patch`, and Node 22+.
 
 ```sh
 make setup
 make check
+make smoke
+make smoke-s3
+```
+
+The [two-client smoke example](examples/smoke.mjs) generates an ephemeral signing key in memory, writes only its public JWKS to a temporary directory, starts an isolated server on `127.0.0.1:4401`, verifies ordered live delivery and failure cases, then stops the server process group and removes temporary files. Override `SMOKE_PORT` if necessary. No AWS account or third-party Node packages are needed.
+
+The [S3 network smoke](examples/s3-smoke.mjs) uses a loopback Python contract server plus the real signing/HTTP adapter. It checks live delivery while head commits are paused, no early persistence notice, lost head responses, crash recovery, exclusive lost-tail resume, finite snapshots, ordered replay/live handoff while publishing and evicting cache, subscribe-only archive continuation, and stale writer fencing. It runs without Docker or AWS. The fixture checks signing metadata but does not validate the signature cryptographically; use the opt-in AWS check before release.
+
+## Replay and continue live
+
+After authentication, subscribe with history permission:
+
+```json
+{"type":"subscribe","id":"s1","subscription":"history","stream":"events","from":"earliest","follow":true,"window":128}
+```
+
+Use `"from":{"after":"<last received cursor>"}` for exclusive resume or `"follow":false` for a finite snapshot. Acknowledge delivered events cumulatively with `{"type":"ack","subscription":"history","through":"<event cursor>"}`. `caught_up` identifies the original captured watermark; subsequent events continue on the same subscription. Handle `discontinuity` as an uncertain crash boundary, with no exact lost count. See [Decision 003](docs/decisions/003-replay-continuation.md) for bounds and traversal costs.
+
+## Run with your application's verification keys
+
+Configure an issuer, audience, and a public JWKS containing 1–16 uniquely identified Ed25519 keys (`kty: OKP`, `crv: Ed25519`, `x`, `kid`). Private keys and symmetric keys are rejected. Have your backend sign compact JWTs with `alg: EdDSA` and the configured `kid`.
+
+```sh
+export HIGHWAY_STORAGE_MODE=development_memory
+export HIGHWAY_JWKS_FILE=/absolute/path/to/public-jwks.json
+export HIGHWAY_JWT_ISSUER=https://app.example.com
+export HIGHWAY_JWT_AUDIENCE=highway
 make run
 ```
 
-The development server binds to `127.0.0.1:4000`.
+Storage mode must be selected explicitly; missing/unknown modes fail startup. `HIGHWAY_BIND` is restricted to `127.0.0.1`, and `HIGHWAY_PORT` defaults to `4000`. Browser Origin must equal `HIGHWAY_ORIGIN` (default `http://localhost:3000`); native clients without Origin are allowed on loopback. Query strings are rejected on `/v1/ws`; send tokens only in an `auth` frame.
+
+`GET /healthz` returns 200. Memory readiness stays 503. S3 readiness remains 503 until storage initialization is confirmed for an owner, then reflects bounded owner/admission health. `/v1/ws` advertises the selected mode and `durable: false`: live acceptance never promises durability.
+
+An optional `HIGHWAY_LIMITS_FILE` points to a JSON object overriding validated positive limits: `max_connections`, `max_streams`, `stream_bytes`, `node_bytes`, `max_records`, `pending_age_ms`, `subscriptions`, `output_bytes`, `slow_ms`, `auth_ms`, `idle_ms`, `tick_ms`, `replay_workers`, `replay_pages_per_step`, `replay_max_pages`, and `replay_timeout_ms`. Defaults and fixed transport limits are in the [protocol](docs/protocol.md). In memory mode, all accepted data remains in memory until an owner terminates; publishes stop at the byte/record limit or 30 seconds after its first accepted event. Restart the demonstration to clear capacity. This is a bounded development adapter, not a continuously draining storage service.
+
+## Enable S3 archival
+
+Supply the same JWT settings above plus an existing private S3 general-purpose bucket and credentials:
 
 ```sh
-curl -i http://127.0.0.1:4000/healthz
+export HIGHWAY_STORAGE_MODE=s3_async
+export HIGHWAY_S3_BUCKET=your-private-bucket
+export HIGHWAY_S3_PREFIX=highway/dev
+export AWS_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+# export AWS_SESSION_TOKEN=your-temporary-session-token
+# export HIGHWAY_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
+make run
 ```
 
-`GET /healthz` returns 200. `GET /readyz` returns 503 until the stream service exists. `GET /v1/ws` currently returns 501 and does not upgrade. Runtime configuration and production packaging belong to later milestones.
+No credentials are stored in the repository. Environment credentials are fixed for the process lifetime. `HIGHWAY_S3_TIMEOUT_MS` defaults to 2000 (allowed 100–10000). Prefixes are nonempty, at most 64 bytes, and canonical lowercase path components; tenant/stream IDs are hex-encoded before becoming object keys. The service remains loopback-only until production packaging/TLS is implemented. Run exactly one server per prefix, using stop-then-start deployments.
 
-## Product decisions
+An owner's initial operation can return retryable `unavailable` while its worker allocates a durable epoch. Retry that command; no publish has been accepted during initialization. Thereafter, live append/fanout never waits on S3. Batches flush at 1 MiB or the next 250 ms timer, with one commit per stream and up to 16 active storage operations. Pending capacity is released only after the authoritative head commit. Storage outages retain accepted records and reject new admission at byte/record/age limits.
 
-- Clients publish and subscribe on the same WebSocket; one socket can carry several subscriptions.
-- The application backend signs access tokens. Highway verifies them and authorizes each stream operation.
-- Live fanout happens before S3 persistence. Publishers receive separate `accepted` and `persisted` messages.
-- Stream order comes from one owner process per stream. Cursor epochs prevent reuse after a restart.
-- S3 is the durable store. The first deployment is one BEAM node per storage prefix, with bounded memory and explicit discontinuities after failures.
+Before an AWS release, explicitly run:
+
+```sh
+HIGHWAY_S3_CONFORMANCE=1 make s3-conformance
+```
+
+This writes fresh test objects only under the configured prefix's `conformance/` subdirectory and leaves them for operator cleanup. It checks actual conditional writes and read visibility; normal tests never require AWS. See [Decision 002](docs/decisions/002-s3-archival.md) for the storage format, permissions, timeout reconciliation, and limitations.
+
+## Contract and limitations
+
+- `accepted` assigns a cursor; delivery and durability are separate. Retries can append duplicates, including repeated `message_id` values.
+- Latest subscriptions follow ordered events and use cumulative `ack` credit. Slow subscriptions terminate explicitly and never silently skip events.
+- Earliest/after reads require history permission and resume exclusively. `follow: false` ends at the captured watermark, including its pending suffix. S3 recovery emits ordered `discontinuity` frames for uncertain tails, even when resuming beyond the archived prefix. Prior memory incarnations remain invalid.
+- Replay uses bounded workers, page steps, bytes, and time; `replay_limit` explicitly terminates excessive work. Latest subscriptions may fetch their own post-start backlog from S3 with only subscribe access. No missing cache range is silently skipped.
+- Expiry and the auth deadline apply on idle connections. Refresh keeps subject/tenant fixed and immediately cancels removed subscriptions.
+- This slice is loopback-only. Production TLS, tenant rate policies, credential refresh, graceful archival drain, deployment packaging, and performance validation remain future work.
+
+Builds apply a reviewed, hash-checked [Mist input-cap patch](patches/mist-input-cap.patch) before compilation. Use `make setup/check/run/smoke` so the cap is present. The Makefile also suppresses only JOSE's deprecated `catch` compiler warning under OTP 29; signature verification uses the maintained library's strict algorithm API. See the [implementation decision](docs/decisions/001-development-live.md).
 
 ## Start here
 
-- [Architecture](docs/architecture.md): guarantees, process model, S3 commits, recovery, and tradeoffs.
-- [Protocol](docs/protocol.md): authentication, claims, frames, reconnects, and limits.
-- [Implementation plan](docs/implementation-plan.md): ordered milestones and acceptance criteria.
-- [Contributing](CONTRIBUTING.md): commands, code conventions, and verification.
+- [Architecture](docs/architecture.md): implemented live, archival, and replay paths.
+- [Protocol](docs/protocol.md): authentication, replay frames, and limits.
+- [Implementation plan](docs/implementation-plan.md): milestone status and validation.
+- [Contributing](CONTRIBUTING.md): development and verification.
 - [Agent instructions](AGENTS.md): constraints for coding agents.
-- [Fresh session prompt](docs/fresh-session-prompt.md): a ready-to-use implementation handoff.
+- [Fresh session prompt](docs/fresh-session-prompt.md): continuation handoff.
 
-## References
-
-[S2](https://github.com/s2-streamstore/s2) supplies the durable stream model. Highway borrows stream ownership, ordered appends, and cursor-based reads, while choosing asynchronous history. This is a separate protocol, with no S2 API compatibility planned.
-
-[Arc's Gleam guidance](https://github.com/alii/arc/blob/master/CLAUDE.md) informs the development workflow: check unfamiliar APIs against actual docs, compile frequently, preserve errors, and keep Erlang FFI small. Highway has its own contribution policy.
+[S2](https://github.com/s2-streamstore/s2) inspired stream ownership and ordered appends. Highway has a separate protocol and deliberately allows live delivery before S3 archival; no S2 compatibility or exactly-once delivery is claimed.

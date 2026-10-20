@@ -20,9 +20,12 @@ jobs:
         with:
           version-file: .tool-versions
           version-type: strict
-      - run: gleam deps download
-      - run: gleam format --check src test
-      - run: gleam check
-      - run: gleam test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: make setup
+      - run: make check
+      - run: make smoke
+      - run: make smoke-s3
       - name: Verify dependency lockfile
         run: git diff --exit-code -- manifest.toml
