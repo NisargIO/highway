@@ -4,6 +4,8 @@ Milestone 6 provides a precompiled OTP shipment, a non-root container, graceful 
 
 ## Package and configure
 
+For a ready-to-run local stack, use `make compose-up` and `make compose-smoke`. [Local Docker Compose instructions](local-compose.md) cover MinIO source builds, generated development credentials/JWTs, persistent volume, loopback-only ports, and real storage outage/restart tests. That development stack is separate from production IAM/TLS setup below.
+
 ```sh
 make setup
 make check
@@ -42,7 +44,7 @@ Supply `HIGHWAY_STORAGE_MODE=s3_async`, the trusted JWT issuer/audience/public J
 
 [deploy/Caddyfile](../deploy/Caddyfile) exposes only `/v1/ws` through Caddy with automatic HTTPS; set `HIGHWAY_PUBLIC_HOST=streams.example.com` in Caddy's environment and configure DNS/certificate issuance normally. Set Highway's `HIGHWAY_ORIGIN` to the exact browser application origin, such as `https://app.example.com`. Caddy preserves the WebSocket Origin; do not strip it or replace it with a trusted value. Native clients without Origin still need a valid JWT. Keep `/healthz`, `/readyz`, and `/metrics` on the private backend; they have no separate admin authentication. Restrict network access and monitor them privately.
 
-Use an existing private general-purpose S3 bucket with Block Public Access and default encryption enabled. [deploy/iam-policy.json](../deploy/iam-policy.json) is a template: replace bucket/prefix placeholders and attach to the service identity, not application JWT holders. Object `GetObject`/`PutObject` are prefix-scoped, with no delete permission. Bucket-scoped `ListBucket` permits reliable missing-object discovery (404 rather than an ambiguous authorization 403); Highway itself never lists to determine history. If stricter listing conditions or KMS encryption are required, validate the resulting permissions against AWS. Use an HTTPS bucket policy and the default HTTPS S3 endpoint. Loopback HTTP is only for local fixture testing; arbitrary plaintext remote S3 endpoints are rejected.
+Use an existing private general-purpose S3 bucket with Block Public Access and default encryption enabled. [deploy/iam-policy.json](../deploy/iam-policy.json) is a template: replace bucket/prefix placeholders and attach to the service identity, not application JWT holders. Object `GetObject`/`PutObject` are prefix-scoped, with no delete permission. Bucket-scoped `ListBucket` permits reliable missing-object discovery (404 rather than an ambiguous authorization 403); Highway itself never lists to determine history. If stricter listing conditions or KMS encryption are required, validate the resulting permissions against AWS. Use an HTTPS bucket policy and the default HTTPS S3 endpoint. Loopback HTTP is only for local testing; arbitrary plaintext remote S3 endpoints are rejected.
 
 The service writes one small versioned canary under `<prefix>/health/<boot-id>.json`, then conditionally updates and reads that same object every probe. Permit that path along with `<prefix>/v1/…`. Conformance objects live under `<prefix>/conformance/…`. Old canaries/conformance objects may be cleaned separately; never apply lifecycle deletion to referenced stream heads/indexes/segments. Canary metadata is not an ownership lock.
 
@@ -52,7 +54,7 @@ Before an AWS release, run explicitly with test credentials/configuration:
 HIGHWAY_S3_CONFORMANCE=1 make s3-conformance
 ```
 
-This writes fresh test objects and leaves them for operator cleanup. Real AWS conformance remains outstanding here. The local fixture verifies conditional/transport behavior but does not cryptographically verify SigV4; local tests are not an AWS deployment certification.
+This writes fresh test objects and leaves them for operator cleanup. Real AWS conformance remains outstanding here. The local fixture verifies conditional/transport behavior but does not cryptographically verify SigV4. The separate MinIO Compose smoke verifies real signatures, conditional writes, disk-backed restart and ordered replay. Neither is an AWS deployment certification.
 
 ## Readiness and metrics
 

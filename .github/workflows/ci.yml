@@ -41,3 +41,7 @@ jobs:
           node-version: 22
       - run: make smoke-container
       - run: make proxy-check
+      - run: make compose-smoke
+      - name: Stop local stack
+        if: always()
+        run: docker compose down --volumes

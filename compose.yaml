@@ -1,0 +1,97 @@
+# Local development: one Highway per prefix. Ports bind host loopback only.
+name: highway-local
+services:
+  minio:
+    image: highway-local-minio:source
+    build:
+      context: .
+      dockerfile: deploy/minio.Dockerfile
+      target: minio
+    command: [server, /data, --console-address, ':9001', --quiet]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio-user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio-password
+      MINIO_SITE_REGION: us-east-1
+      MINIO_UPDATE: 'off'
+    secrets: [minio-user, minio-password]
+    volumes: [minio-data:/data]
+    ports:
+      - '127.0.0.1:${HIGHWAY_LOCAL_PORT:-4000}:4000'
+      - '127.0.0.1:${MINIO_LOCAL_PORT:-9000}:9000'
+      - '127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001'
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, 'http://127.0.0.1:9000/minio/health/live']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 15s
+
+  minio-init:
+    image: highway-local-mc:source
+    build:
+      context: .
+      dockerfile: deploy/minio.Dockerfile
+      target: mc
+    command: [initialize]
+    secrets: [minio-user, minio-password]
+    depends_on:
+      minio: {condition: service_healthy}
+    read_only: true
+    tmpfs: ['/tmp:noexec,nosuid,size=16m']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  highway:
+    image: highway:0.1.0
+    build: .
+    # Preserve the service's HTTPS-or-loopback S3 policy. Both processes share
+    # loopback, while filesystems, users, and process lifecycles stay separate.
+    network_mode: service:minio
+    environment:
+      HIGHWAY_STORAGE_MODE: s3_async
+      HIGHWAY_S3_ENDPOINT: http://127.0.0.1:9000
+      HIGHWAY_S3_BUCKET: highway
+      HIGHWAY_S3_PREFIX: local
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID_FILE: /run/secrets/minio-user
+      AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/minio-password
+      HIGHWAY_JWKS_FILE: /run/secrets/public-jwks
+      HIGHWAY_JWT_ISSUER: highway-compose
+      HIGHWAY_JWT_AUDIENCE: highway
+      HIGHWAY_PROBE_MS: '500'
+      HIGHWAY_PROBE_STALE_MS: '4000'
+      HIGHWAY_S3_TIMEOUT_MS: '1000'
+      HIGHWAY_DRAIN_MS: '10000'
+    secrets: [minio-user, minio-password, public-jwks]
+    depends_on:
+      minio-init: {condition: service_completed_successfully}
+    read_only: true
+    tmpfs: ['/tmp:noexec,nosuid,size=16m']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 25s
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, 'http://127.0.0.1:4000/readyz']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  mc:
+    profiles: [tools]
+    image: highway-local-mc:source
+    secrets: [minio-user, minio-password]
+    read_only: true
+    tmpfs: ['/tmp:noexec,nosuid,size=16m']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+secrets:
+  minio-user: {file: ./build/compose/minio-user}
+  minio-password: {file: ./build/compose/minio-password}
+  public-jwks: {file: ./build/compose/public-jwks.json}
+volumes:
+  minio-data:

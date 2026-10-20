@@ -66,3 +66,19 @@ benchmark: smoke-release
 .PHONY: proxy-check
 proxy-check:
 	node examples/proxy-smoke.mjs
+
+.PHONY: compose-config compose-up compose-down compose-token compose-smoke
+compose-config:
+	node scripts/compose-config.mjs
+
+compose-up: compose-config
+	docker compose up --build -d --wait
+
+compose-down:
+	docker compose down
+
+compose-token:
+	node scripts/compose-config.mjs token
+
+compose-smoke: compose-up
+	node examples/compose-smoke.mjs

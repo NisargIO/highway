@@ -14,6 +14,7 @@ make smoke-s3 # S3 archival, restart, replay/live races through real adapter and
 make sdk-check # Locked TypeScript declaration check and SDK tests
 make smoke-release # Native shipment, SDK, drain/restart and local measurements
 make smoke-container # Docker runtime, non-root/read-only and SIGTERM
+make compose-smoke # Real MinIO, storage outage/restart and SDK replay (Docker)
 make format   # Format source and tests
 make check    # Format check, type check, and tests
 ```

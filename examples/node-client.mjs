@@ -1,7 +1,8 @@
-// Node 22+. Token file lives outside the repository and may be replaced before
-// expiry. The same getToken callback is used on connect and automatic refresh.
+// Node 22+. Keep the token file private and untracked; replace before expiry.
+// The same getToken callback is used on connect and automatic refresh.
 import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { HighwayClient } from '../sdk/javascript/index.js';
 if (!process.env.HIGHWAY_TOKEN_FILE) throw new Error('Set HIGHWAY_TOKEN_FILE to a short-lived JWT file');
 const client = new HighwayClient({
@@ -17,7 +18,17 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => client.clos
 try {
   await client.connect();
   if (process.argv[2] === 'publish') {
-    const accepted = await client.publish({ stream, messageId: randomUUID(), data: { text: 'Hello from Node.js' } });
+    const messageId = randomUUID(), deadline = Date.now() + 5000;
+    let accepted;
+    for (;;) {
+      try { accepted = await client.publish({ stream, messageId, data: { text: 'Hello from Node.js' } }); break; }
+      catch (error) {
+        // A new/recovered S3 owner allocates its epoch before admission. Retry
+        // only an explicit rejection; never retry an unknown publish outcome.
+        if (error.code !== 'unavailable' || Date.now() >= deadline) throw error;
+        await delay(100);
+      }
+    }
     console.log(`Accepted ${accepted.cursor} into memory. Await separate persistence notices.`);
     // Remain connected for notices; Ctrl-C closes without retrying the publish.
   } else {

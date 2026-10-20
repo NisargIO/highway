@@ -23,6 +23,8 @@ The [two-client smoke example](examples/smoke.mjs) generates an ephemeral signin
 
 The [S3 network smoke](examples/s3-smoke.mjs) uses a loopback Python contract server plus the real signing/HTTP adapter. It checks live delivery while head commits are paused, no early persistence notice, lost head responses, crash recovery, exclusive lost-tail resume, finite snapshots, ordered replay/live handoff while publishing and evicting cache, subscribe-only archive continuation, and stale writer fencing. It runs without Docker or AWS. The fixture checks signing metadata but does not validate the signature cryptographically; use the opt-in AWS check before release.
 
+For a persistent local object store, run `make compose-up` and `make compose-smoke`. [Docker Compose with MinIO](docs/local-compose.md) builds pinned source, initializes a private bucket and tests real SigV4/conditional writes, live delivery during an outage, graceful drain, both-service restart, and ordered SDK replay. The stack stays running at `ws://127.0.0.1:4000/v1/ws`, with the MinIO console at `http://127.0.0.1:9001`. `make compose-token` writes a local JWT for the examples; `make compose-down` stops the stack while preserving history.
+
 ## Deploy and use clients
 
 `make release` exports a native OTP shipment. `make image` builds a digest-pinned non-root runtime container; `make smoke-container` verifies read-only execution and signal handling. See [deployment instructions](docs/deployment.md) for secrets, private S3 IAM, TLS/Caddy, readiness, metrics, graceful drain and stop-then-start upgrades. Exactly one server per prefix remains required.
