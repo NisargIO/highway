@@ -10,7 +10,7 @@ Read `CONTRIBUTING.md`, `docs/architecture.md`, `docs/protocol.md`, and `docs/im
 - One owner serializes a stream. Never reuse cursors across owner restarts. An actor restart is a data-loss boundary for its pending tail.
 - Bound pending bytes, connection queues, replay concurrency, and actor mailboxes. Reject overload before accepting a publish.
 - Never expose an S3 segment until the authoritative head references its index. Do not acknowledge persistence after a PUT alone.
-- Version one supports one server per storage prefix. Do not introduce transparent failover or distributed ownership without a new design decision.
+- Standalone mode supports one server per storage prefix. Clustered ownership follows [Decision 006](docs/decisions/006-multi-region-ownership.md): head leases with a live admission fence, mirrors over Erlang distribution, sleep/wake. Do not change ownership, fencing or failover semantics without a new design decision.
 - Do not add a database, message broker, local WAL requirement, or Rust storage engine to bypass the chosen scope.
 
 ## Gleam workflow

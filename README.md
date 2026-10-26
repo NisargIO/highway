@@ -25,9 +25,13 @@ The [S3 network smoke](examples/s3-smoke.mjs) uses a loopback Python contract se
 
 For a persistent local object store, run `make compose-up` and `make compose-smoke`. [Docker Compose with MinIO](docs/local-compose.md) builds pinned source, initializes a private bucket and tests real SigV4/conditional writes, live delivery during an outage, graceful drain, both-service restart, and ordered SDK replay. The stack stays running at `ws://127.0.0.1:4000/v1/ws`, with the MinIO console at `http://127.0.0.1:9001`. `make compose-token` writes a local JWT for the examples; `make compose-down` stops the stack while preserving history.
 
+## Cluster mode: one endpoint, many regions
+
+Set `HIGHWAY_CLUSTER_NODE`, `HIGHWAY_REGION` and a shared `HIGHWAY_CLUSTER_COOKIE(_FILE)` on every node, and point them all at the same bucket and prefix. Behind one latency-routed hostname, a stream is created on the node its first publisher reaches. Clients on other nodes are served by a local mirror, and their publishes are forwarded to the owner, which alone assigns cursors. Owners hold a lease in head v3 and stop admitting before it lapses. A crashed owner's streams move after lease plus skew; drained or idle (sleeping) streams wake wherever they are touched next. Clients and the SDK are unchanged. `make smoke-cluster` runs two nodes as `us-east-1` and `eu-west-1`. See [Decision 006](docs/decisions/006-multi-region-ownership.md) and [cluster deployment](docs/deployment.md#cluster-mode).
+
 ## Deploy and use clients
 
-`make release` exports a native OTP shipment. `make image` builds a digest-pinned non-root runtime container; `make smoke-container` verifies read-only execution and signal handling. See [deployment instructions](docs/deployment.md) for secrets, private S3 IAM, TLS/Caddy, readiness, metrics, graceful drain and stop-then-start upgrades. Exactly one server per prefix remains required.
+`make release` exports a native OTP shipment. `make image` builds a digest-pinned non-root runtime container; `make smoke-container` verifies read-only execution and signal handling. See [deployment instructions](docs/deployment.md) for secrets, private S3 IAM, TLS/Caddy, readiness, metrics, graceful drain and stop-then-start upgrades. In standalone mode, exactly one server per prefix remains required.
 
 The [JavaScript SDK](sdk/javascript/README.md) supports Node.js 22+ and browsers, TypeScript declarations, token refresh, bounded async iteration, processed-cursor resume, and separate accepted/persisted events. It is implemented locally and has not been published to npm. Try [the Node example](examples/node-client.mjs) or serve the repository locally with `python3 -m http.server 3000 --bind 127.0.0.1` and open `http://localhost:3000/examples/browser/` for the [browser example](examples/browser/index.html). Obtain short-lived JWTs from your backend; no signing key belongs in either client. Create the stream with an authorized publish before subscribing.
 
@@ -119,7 +123,7 @@ This writes fresh test objects only under the configured prefix's `conformance/`
 - Replay uses bounded workers, page steps, bytes, and time; `replay_limit` explicitly terminates excessive work. Latest subscriptions may fetch their own post-start backlog from S3 with only subscribe access. No missing cache range is silently skipped.
 - Expiry and the auth deadline apply on idle connections. Refresh keeps subject/tenant fixed and immediately cancels removed subscriptions.
 - SIGTERM closes admission, drains accepted records through authoritative head commits, and confirms closed heads before successful shutdown. Timeout exits nonzero; unconfirmed data stays uncertain. Recovery conservatively reports interruption boundaries even after clean shutdown.
-- TLS terminates at the proxy. Real AWS conformance, automatic AWS credential refresh, tenant rate policies, long-running scale validation, retention and distributed ownership remain future work.
+- TLS terminates at the proxy. Real AWS conformance, automatic AWS credential refresh, tenant rate policies, long-running scale validation and retention remain future work. Cluster mode has no read replicas or region-aware readiness yet, and it relies on Erlang distribution between nodes.
 
 Builds apply a reviewed, hash-checked [Mist input-cap patch](patches/mist-input-cap.patch) before compilation. Use `make setup/check/run/smoke` so the cap is present. The Makefile also suppresses only JOSE's deprecated `catch` compiler warning under OTP 29; signature verification uses the maintained library's strict algorithm API. See the [implementation decision](docs/decisions/001-development-live.md).
 

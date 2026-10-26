@@ -8,6 +8,7 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import highway/cluster
 import highway/config.{type Limits}
 import highway/domain.{
   type Cursor, type Error, type Event, type Stream, type Tenant,
@@ -44,12 +45,19 @@ type Message {
 
 type Operation {
   Shutdown(Subject(Nil))
-  Publish(Tenant, Stream, String, json.Json, Subject(Result(Event, Error)))
+  Publish(Tenant, Stream, String, json.Json, Subject(Result(Admission, Error)))
   Find(Tenant, Stream, Subject(Result(#(Owner, Cursor), Error)))
   Ready(Subject(Bool))
   Replayer(Subject(replay.Launcher))
   BeginDrain(Subject(Result(Nil, Error)))
   Inspect(Subject(Snapshot))
+}
+
+/// A mirror's publish is forwarded by the caller, never inside this actor:
+/// the cross-node round trip must not serialize every stream on this node.
+type Admission {
+  Appended(Event)
+  Forward(Owner)
 }
 
 type State {
@@ -107,6 +115,24 @@ pub fn start_operational(
   prefix: String,
   settings: config.Operational,
 ) -> actor.StartResult(Registry) {
+  start_cluster(
+    registration,
+    limits,
+    store,
+    prefix,
+    settings,
+    config.Standalone,
+  )
+}
+
+pub fn start_cluster(
+  registration: Registration,
+  limits: Limits,
+  store: Option(Store),
+  prefix: String,
+  settings: config.Operational,
+  cluster_settings: config.Cluster,
+) -> actor.StartResult(Registry) {
   let context = registration.context
   let store = option.map(store, operations.measured(context, _))
   runtime.reset(registration.gate)
@@ -114,13 +140,15 @@ pub fn start_operational(
     let slots = runtime.slots()
     use workers <- result.try(
       factory.worker_child(fn(args: #(Tenant, Stream, Bool)) {
-        owner.start_operational(
+        owner.start_cluster(
           limits,
           store,
           archive.scope(prefix, args.0, args.1),
           args.2,
           slots,
           Some(context),
+          cluster_settings,
+          #(args.0, args.1),
         )
       })
       |> factory.restart_strategy(supervision.Temporary)
@@ -135,6 +163,13 @@ pub fn start_operational(
       health.start(context, store, prefix, settings.probe_ms)
       |> result.map_error(fn(_) { "health worker startup failed" }),
     )
+    case cluster_settings {
+      config.Clustered(..) -> {
+        cluster.retired_table()
+        cluster.put_registry(reference(registration))
+      }
+      config.Standalone -> Nil
+    }
     actor.initialised(State(dict.new(), workers.data, readers.data, None, False))
     |> Ok
   })
@@ -142,6 +177,7 @@ pub fn start_operational(
   |> actor.on_message(fn(state, request) {
     let Request(permit, msg) = request
     runtime.release_permit(registration.gate, permit)
+    cluster.prune_retired(runtime.monotonic_ms() - 60_000)
     let state =
       State(
         ..state,
@@ -213,28 +249,44 @@ pub fn start_operational(
                     process.send(reply, Error(e))
                     actor.continue(state)
                   }
-                  Ok(o) -> {
-                    let outcome =
-                      owner.append(o, id, data, runtime.monotonic_ms())
-                    let owners = case
-                      outcome,
-                      store,
-                      dict.has_key(state.owners, key)
-                    {
-                      Error(_), None, False -> {
-                        stop_owner(o)
-                        state.owners
+                  Ok(o) ->
+                    case owner.forwarding(o) {
+                      True -> {
+                        process.send(reply, Ok(Forward(o)))
+                        actor.continue(
+                          State(
+                            ..state,
+                            owners: dict.insert(state.owners, key, o),
+                          ),
+                        )
                       }
-                      _, _, _ -> dict.insert(state.owners, key, o)
+                      False -> {
+                        let outcome =
+                          owner.append(o, id, data, runtime.monotonic_ms())
+                        let owners = case
+                          outcome,
+                          store,
+                          dict.has_key(state.owners, key)
+                        {
+                          Error(_), None, False -> {
+                            stop_owner(o)
+                            state.owners
+                          }
+                          _, _, _ -> dict.insert(state.owners, key, o)
+                        }
+                        case outcome {
+                          Error(_) ->
+                            operations.add(
+                              context,
+                              operations.PublishRejected,
+                              1,
+                            )
+                          _ -> Nil
+                        }
+                        process.send(reply, result.map(outcome, Appended))
+                        actor.continue(State(..state, owners: owners))
+                      }
                     }
-                    case outcome {
-                      Error(_) ->
-                        operations.add(context, operations.PublishRejected, 1)
-                      _ -> Nil
-                    }
-                    process.send(reply, outcome)
-                    actor.continue(State(..state, owners: owners))
-                  }
                 }
             }
         }
@@ -336,11 +388,25 @@ pub fn publish(
   use permit <- result.try(
     runtime.permit(registry.gate) |> result.replace_error(domain.RateLimited),
   )
-  runtime.call(registry.subject, 2000, fn(reply) {
-    Request(permit, Publish(tenant, stream, id, data, reply))
-  })
-  |> result.map_error(log_call_error)
-  |> result.unwrap(Error(domain.Unavailable))
+  let admitted =
+    runtime.call(registry.subject, 2000, fn(reply) {
+      Request(permit, Publish(tenant, stream, id, data, reply))
+    })
+    |> result.map_error(log_call_error)
+    |> result.unwrap(Error(domain.Unavailable))
+  case admitted {
+    Ok(Appended(event)) -> Ok(event)
+    Ok(Forward(mirror)) -> {
+      let outcome = owner.append(mirror, id, data, runtime.monotonic_ms())
+      case outcome {
+        Error(_) ->
+          operations.add(registry.context, operations.PublishRejected, 1)
+        Ok(_) -> Nil
+      }
+      outcome
+    }
+    Error(e) -> Error(e)
+  }
 }
 
 pub fn find(

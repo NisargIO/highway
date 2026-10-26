@@ -13,6 +13,8 @@ pub type Error {
   Busy
   Limit
   Access(domain.Error)
+  /// Another node holds an unexpired ownership lease on an open head.
+  Leased(node: String, region: String, until: Int)
 }
 
 pub type Condition {

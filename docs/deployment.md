@@ -1,6 +1,6 @@
-# Single-node deployment
+# Deployment
 
-Milestone 6 provides a precompiled OTP shipment, a non-root container, graceful SIGTERM drain, active storage/admission readiness, Prometheus metrics, and Node/browser clients. Run **exactly one server per S3 prefix**. Use stop-then-start upgrades. Head CAS fences stale storage requests; it is not a distributed live ownership lease. Do not run overlapping replicas, rolling replacements, or automatic failover.
+Milestone 6 provides a precompiled OTP shipment, a non-root container, graceful SIGTERM drain, active storage/admission readiness, Prometheus metrics, and Node/browser clients. In standalone mode (the default), run **exactly one server per S3 prefix**. Several nodes can share a prefix only in [cluster mode](#cluster-mode). Use stop-then-start upgrades. Head CAS fences stale storage requests; it is not a distributed live ownership lease. Do not run overlapping replicas, rolling replacements, or automatic failover.
 
 ## Package and configure
 
@@ -99,3 +99,21 @@ make proxy-check    # Caddy route isolation (no public certificate issuance)
 `make benchmark` runs the release scenario and writes `build/benchmark.json`. See [benchmarks.md](benchmarks.md) for a measured local sample, test configuration, and what it does not establish. Default connection/stream/memory settings remain conservative configurable bounds, not measured production throughput promises. Deep reverse-linked replay still has explicit page/time limits; checkpoint indexing, tenant rate policies, long-running scale/load validation, retention, and distributed ownership remain future work. The Node/browser SDK is locally packaged and tested, not published to npm.
 
 References: [Gleam official images](https://github.com/gleam-lang/gleam/pkgs/container/gleam), [Caddy reverse proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy), [S3 GetObject missing-key permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html), and [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
+
+## Cluster mode
+
+Cluster mode ([Decision 006](decisions/006-multi-region-ownership.md)) runs any number of nodes, in one or more regions, against **one primary bucket and prefix**. Put them behind one hostname with latency-based DNS or anycast, so each client reaches its nearest region. The first publish creates a stream on the node it reached; other nodes mirror it and forward publishes to that owner.
+
+```sh
+export HIGHWAY_STORAGE_MODE=s3_async
+export HIGHWAY_CLUSTER_NODE=highway-a@10.0.1.5   # unique, resolvable by peers
+export HIGHWAY_REGION=us-east-1
+export HIGHWAY_CLUSTER_COOKIE_FILE=/run/secrets/highway-cookie
+# Optional: HIGHWAY_LEASE_MS=10000 HIGHWAY_MAX_CLOCK_SKEW_MS=1000 HIGHWAY_SLEEP_IDLE_MS=300000
+```
+
+- **Network and trust:** Erlang distribution is full trust; anyone with the cookie can run code on every node. Keep nodes on a private network and allow epmd (TCP 4369) and the distribution port range only between them. Across regions, boot with TLS distribution, for example `ERL_FLAGS="-name highway-a@10.0.1.5 -proto_dist inet_tls -ssl_dist_optfile /etc/highway/dist.conf"`. The server keeps a node name supplied this way. Without `-name`, it starts distribution itself and runs `epmd -daemon` if needed.
+- **Clocks:** leases use wall clocks. Keep every node's clock error below `HIGHWAY_MAX_CLOCK_SKEW_MS`, for example with the Amazon Time Sync Service.
+- **Replacement:** SIGTERM drains a node's streams to closed heads, which any other node can claim at once, so nodes running the same release can be replaced one at a time. Mixed-release clusters are untested; remote calls assume identical module versions. A crashed node's streams move after their lease plus skew.
+- **Cost:** each awake idle stream rewrites its head once per half lease term; sleeping streams cost nothing. All S3 traffic goes to the primary bucket's region.
+- **Limits:** readiness still requires the primary bucket's canary, so an outage in that region marks every node unready. There are no read replicas.

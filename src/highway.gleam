@@ -3,6 +3,7 @@ import gleam/option.{None, Some}
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/string
+import highway/cluster
 import highway/config
 import highway/http
 import highway/lifecycle
@@ -10,6 +11,7 @@ import highway/observability as logging
 import highway/operations
 import highway/registry
 import highway/runtime
+import highway/secrets
 import highway/storage/s3
 import mist
 
@@ -20,6 +22,23 @@ pub fn main() -> Nil {
     Error(reason) -> panic as reason
   }
   let assert Ok(_) = config.validate(config.limits)
+  let cluster_settings = case config.load_cluster(config.storage) {
+    Ok(c) -> c
+    Error(reason) -> panic as reason
+  }
+  case cluster_settings {
+    config.Standalone -> Nil
+    config.Clustered(node: node, ..) -> {
+      let cookie = case secrets.required("HIGHWAY_CLUSTER_COOKIE") {
+        Ok(cookie) -> cookie
+        Error(reason) -> panic as reason
+      }
+      case cluster.start(node, cookie) {
+        Ok(_) -> Nil
+        Error(reason) -> panic as reason
+      }
+    }
+  }
   let #(store, prefix) = case config.storage {
     config.DevelopmentMemory -> #(None, "")
     config.S3(settings) -> #(Some(s3.store(settings)), settings.prefix)
@@ -37,12 +56,13 @@ pub fn main() -> Nil {
     supervisor.new(supervisor.OneForAll)
     |> supervisor.add(
       supervision.worker(fn() {
-        registry.start_operational(
+        registry.start_cluster(
           registration,
           config.limits,
           store,
           prefix,
           config.operational,
+          cluster_settings,
         )
       }),
     )
@@ -54,7 +74,16 @@ pub fn main() -> Nil {
         config.DevelopmentMemory ->
           "Explicit development memory mode: ephemeral; never emits persisted"
         config.S3(_) ->
-          "S3 archival enabled: acceptance precedes durability; one server per prefix"
+          case cluster_settings {
+            config.Standalone ->
+              "S3 archival enabled: acceptance precedes durability; one server per prefix"
+            config.Clustered(node: node, region: region, ..) ->
+              "S3 archival enabled in cluster mode as "
+              <> node
+              <> " ("
+              <> region
+              <> "): stream ownership uses head leases"
+          }
       })
       let lifecycle.Stop = process.receive_forever(signals)
       let result = lifecycle.drain(registry, config.operational.drain_ms)

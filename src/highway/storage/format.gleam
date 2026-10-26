@@ -2,9 +2,10 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import highway/config
 import highway/domain.{type Cursor, type Event}
 import highway/protocol
 import highway/storage.{type Error}
@@ -18,7 +19,14 @@ pub type Head {
     archived: Cursor,
     commit_id: String,
     closed: Bool,
+    owner: Option(Lease),
   )
+}
+
+/// Cluster ownership lease (head format v3). `until` is the owner's wall-clock
+/// deadline in milliseconds. It binds other nodes only while the head is open.
+pub type Lease {
+  Lease(node: String, region: String, until: Int)
 }
 
 pub type Entry {
@@ -83,12 +91,30 @@ pub fn decode_head(bytes: String) -> Result(Head, Error) {
       use index <- decode.field("index", decode.optional(decode.string))
       use archived <- decode.field("archived", cursor())
       use commit <- decode.field("commit_id", protocol.name())
+      use owner <- decode.optional_field(
+        "owner",
+        None,
+        decode.optional({
+          use node <- decode.field("node", decode.string)
+          use region <- decode.field("region", decode.string)
+          use until <- decode.field("lease_until", decimal())
+          case config.node_name(node) && config.region_name(region) {
+            True -> decode.success(Lease(node, region, until))
+            False -> decode.failure(Lease("", "", 0), "owner lease")
+          }
+        }),
+      )
       case
         {
           v == 1
           && status == "open"
+          && owner == None
           || v == 2
           && { status == "open" || status == "closed" }
+          && owner == None
+          || v == 3
+          && { status == "open" || status == "closed" }
+          && owner != None
         }
         && epoch > 0
       {
@@ -100,9 +126,13 @@ pub fn decode_head(bytes: String) -> Result(Head, Error) {
             archived,
             commit,
             status == "closed",
+            owner,
           ))
         False ->
-          decode.failure(Head("", 1, None, archived, "", False), "open epoch")
+          decode.failure(
+            Head("", 1, None, archived, "", False, None),
+            "open epoch",
+          )
       }
     },
     "head format",
@@ -117,9 +147,30 @@ pub fn decode_head(bytes: String) -> Result(Head, Error) {
   }
 }
 
+/// Standalone heads stay v2 so a singleton deployment can still roll back to a
+/// v2 reader. Only clustered owners write v3 with an ownership lease.
 pub fn head(h: Head) -> String {
+  let owner = case h.owner {
+    None -> []
+    Some(Lease(node, region, until)) -> [
+      #(
+        "owner",
+        json.object([
+          #("node", json.string(node)),
+          #("region", json.string(region)),
+          #("lease_until", dec(until)),
+        ]),
+      ),
+    ]
+  }
   json.object([
-    #("version", json.int(2)),
+    #(
+      "version",
+      json.int(case h.owner {
+        None -> 2
+        Some(_) -> 3
+      }),
+    ),
     #("incarnation", json.string(h.incarnation)),
     #("epoch", dec(h.epoch)),
     #(
@@ -132,6 +183,7 @@ pub fn head(h: Head) -> String {
     #("index", json.nullable(h.index, json.string)),
     #("archived", cur(h.archived)),
     #("commit_id", json.string(h.commit_id)),
+    ..owner
   ])
   |> json.to_string
 }

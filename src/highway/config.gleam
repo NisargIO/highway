@@ -5,6 +5,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/result
+import gleam/string
 import highway/auth
 import highway/protocol
 import highway/storage/s3
@@ -324,4 +325,88 @@ fn env_int(name: String, default: Int) -> Result(Int, String) {
   |> result.unwrap(int.to_string(default))
   |> int.parse
   |> result.replace_error("invalid " <> name)
+}
+
+/// Ownership placement. Standalone keeps the version one singleton contract:
+/// heads carry no lease and no admission fence applies. Clustered nodes share
+/// one primary bucket/prefix and coordinate ownership through head leases.
+pub type Cluster {
+  Standalone
+  Clustered(
+    node: String,
+    region: String,
+    lease_ms: Int,
+    skew_ms: Int,
+    sleep_ms: Int,
+  )
+}
+
+pub fn load_cluster(storage: StorageMode) -> Result(Cluster, String) {
+  case envoy.get("HIGHWAY_CLUSTER_NODE") {
+    Error(_) -> Ok(Standalone)
+    Ok(node) -> {
+      use region <- result.try(
+        envoy.get("HIGHWAY_REGION")
+        |> result.replace_error("HIGHWAY_REGION is required in cluster mode"),
+      )
+      use lease <- result.try(env_int("HIGHWAY_LEASE_MS", 10_000))
+      use skew <- result.try(env_int("HIGHWAY_MAX_CLOCK_SKEW_MS", 1000))
+      use sleep <- result.try(env_int("HIGHWAY_SLEEP_IDLE_MS", 300_000))
+      use _ <- result.try(case storage {
+        S3(_) -> Ok(Nil)
+        DevelopmentMemory -> Error("cluster mode requires s3_async storage")
+      })
+      validate_cluster(Clustered(node, region, lease, skew, sleep))
+    }
+  }
+}
+
+pub fn validate_cluster(c: Cluster) -> Result(Cluster, String) {
+  case c {
+    Standalone -> Ok(c)
+    Clustered(node, region, lease, skew, sleep) ->
+      case
+        node_name(node)
+        && region_name(region)
+        && lease >= 1000
+        && lease <= 120_000
+        && skew >= 0
+        && skew * 4 <= lease
+        && { sleep == 0 || sleep >= lease && sleep <= 86_400_000 }
+      {
+        True -> Ok(c)
+        False ->
+          Error(
+            "invalid cluster settings: node name@host, region, lease 1000..120000 ms, skew <= lease/4, sleep 0 or >= lease",
+          )
+      }
+  }
+}
+
+/// Erlang long node names: `name@host`, restricted so storage-provided node
+/// names are safe to convert into distribution atoms.
+pub fn node_name(value: String) -> Bool {
+  case string.split(value, "@") {
+    [name, host] ->
+      name != ""
+      && host != ""
+      && string.byte_size(value) <= 128
+      && charset(name, "abcdefghijklmnopqrstuvwxyz0123456789_-")
+      && charset(
+        host,
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-",
+      )
+    _ -> False
+  }
+}
+
+pub fn region_name(value: String) -> Bool {
+  value != ""
+  && string.byte_size(value) <= 64
+  && charset(value, "abcdefghijklmnopqrstuvwxyz0123456789-")
+}
+
+fn charset(value: String, allowed: String) -> Bool {
+  string.to_graphemes(value)
+  |> list.all(fn(c) { string.contains(allowed, c) })
 }

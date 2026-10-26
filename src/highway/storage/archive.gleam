@@ -84,11 +84,41 @@ fn publish(
   }
 }
 
+/// A clustered node claiming ownership. Times are wall-clock milliseconds.
+pub type Claimant {
+  Claimant(
+    node: String,
+    region: String,
+    now_ms: Int,
+    lease_ms: Int,
+    skew_ms: Int,
+  )
+}
+
 pub fn open(
   store: Store,
   scope: String,
   create: Bool,
 ) -> Result(Session, Error) {
+  claim(store, scope, create, None)
+}
+
+/// Create, wake or take over a stream. A clustered claimant respects another
+/// node's open-head lease until `until + skew`; a closed (sleeping) head or an
+/// expired lease is claimed with a new epoch through the head CAS. The same
+/// node name may reclaim immediately: a running node owns its name, so an
+/// older lease under that name belongs to a dead owner process. Standalone
+/// claims ignore leases (singleton contract) and write lease-free v2 heads.
+pub fn claim(
+  store: Store,
+  scope: String,
+  create: Bool,
+  claimant: Option(Claimant),
+) -> Result(Session, Error) {
+  let lease =
+    option.map(claimant, fn(c) {
+      format.Lease(c.node, c.region, c.now_ms + c.lease_ms)
+    })
   case store.get(scope <> "head.json") {
     Error(storage.NotFound) if create -> {
       let incarnation = runtime.incarnation()
@@ -100,12 +130,21 @@ pub fn open(
           domain.Cursor(incarnation, 1, 0),
           runtime.incarnation(),
           False,
+          lease,
         )
       publish(store, scope, None, head)
     }
     Error(e) -> Error(e)
     Ok(object) -> {
       use old <- result.try(format.decode_head(object.body))
+      use _ <- result.try(case claimant, old.owner {
+        Some(c), Some(held)
+          if !old.closed
+          && held.node != c.node
+          && c.now_ms < held.until + c.skew_ms
+        -> Error(storage.Leased(held.node, held.region, held.until))
+        _, _ -> Ok(Nil)
+      })
       // Read the authoritative tip before recovery; never use bucket listing.
       use _ <- result.try(validate_tip(store, scope, old))
       let id = runtime.incarnation()
@@ -120,6 +159,7 @@ pub fn open(
           index: Some(key),
           commit_id: id,
           closed: False,
+          owner: lease,
         )
       publish(store, scope, Some(object), next)
     }
@@ -151,6 +191,15 @@ fn validate_tip(store: Store, scope: String, head: Head) -> Result(Nil, Error) {
 }
 
 pub fn plan(base: Session, events: List(Event)) -> Result(Plan, Error) {
+  plan_leased(base, events, base.head.owner)
+}
+
+/// A clustered owner extends its lease with every data commit.
+pub fn plan_leased(
+  base: Session,
+  events: List(Event),
+  lease: Option(format.Lease),
+) -> Result(Plan, Error) {
   use _ <- result.try(case base.head.closed {
     True -> Error(storage.Conflict)
     False -> Ok(Nil)
@@ -204,6 +253,7 @@ pub fn plan(base: Session, events: List(Event)) -> Result(Plan, Error) {
       index: Some(index_key),
       archived: last.cursor,
       commit_id: id,
+      owner: lease,
     ),
     segment_key,
     body,
@@ -301,6 +351,19 @@ pub fn closure(base: Session) -> Closure {
   Closure(
     base,
     format.Head(..base.head, closed: True, commit_id: runtime.incarnation()),
+  )
+}
+
+/// Lease-only head rewrite for an idle clustered owner. It keeps the archived
+/// cursor and index, so readers observe no history change.
+pub fn renewal(base: Session, lease: format.Lease) -> Closure {
+  Closure(
+    base,
+    format.Head(
+      ..base.head,
+      owner: Some(lease),
+      commit_id: runtime.incarnation(),
+    ),
   )
 }
 
