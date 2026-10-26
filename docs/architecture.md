@@ -131,7 +131,7 @@ Fixed node-level metrics expose acceptance/persistence progress, pending bytes, 
 
 ## Deployment and future work
 
-Version one runs exactly one BEAM node against a storage prefix. Use stop-then-start deployment; overlapping rolling updates are unsupported. S3 head preconditions detect conflicting persistence, but do not fence a stale process from sending live events. They are not a distributed lease. Automatic takeover requires an ownership design that fences both live and storage paths.
+Version one runs exactly one BEAM node against a storage prefix. Use stop-then-start deployment; overlapping rolling updates are unsupported. S3 head preconditions detect conflicting persistence, but do not fence a stale process from sending live events. They are not a distributed lease. Automatic takeover requires an ownership design that fences both live and storage paths. [Decision 006](decisions/006-multi-region-ownership.md) proposes one, not yet implemented: head leases, a single-endpoint resolver for each stream's region, and a single primary bucket for heads.
 
 Defer clustering, multi-region writes, consumer groups, server-stored consumer offsets, arbitrary filtering, search, compaction, retention deletion, and S2 API compatibility. Initial history is append-only with no automatic deletion. Never enable lifecycle deletion for referenced segments without retention metadata and replay semantics.
 
