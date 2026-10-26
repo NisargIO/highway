@@ -1,110 +1,90 @@
 # Decision 006: multi-region stream ownership behind one endpoint
 
-Status: proposed design; nothing here is implemented. Version one's rule of exactly one server per storage prefix stays in force until this decision is accepted and its fencing is built and tested. The live/durable split, cursor rules and authorization model are unchanged.
+Status: implemented as opt-in **cluster mode**. Without `HIGHWAY_CLUSTER_NODE`, a server stays standalone: exactly one server per prefix, v2 heads with no lease, and no admission fence, exactly as before. The live/durable split, cursor rules, wire protocol and authorization model are unchanged in both modes. Items marked *not implemented* below remain future work.
 
 ## Goal
 
-Clients use a single endpoint such as `wss://streams.example.com/v1/ws`. The first authorized publish creates a stream in the region nearest that client. While a stream is awake, every command for it, from any region, reaches the one owner in the region that created or last woke it. A sleeping stream wakes in the region nearest whoever touches it next. The SDK and wire protocol need no changes for this; routing is entirely server-side.
+Clients use a single endpoint such as `wss://streams.example.com/v1/ws`, placed behind latency-based DNS or anycast. The first authorized publish creates a stream on the node, and so in the region, that the client reached. While a stream is awake, every command for it reaches the one owner that created or last woke it, from any node. A sleeping stream wakes wherever it is touched next. Clients and the SDK need no changes.
 
-One owner still orders each stream. "Nearest region" chooses where that single owner runs. It never means writing in several regions at once.
-
-## Non-goals
-
-- Multi-writer or active-active streams, consensus on the publish path, or exactly-once delivery.
-- A new database, broker or WAL (see `AGENTS.md`). Coordination uses the existing S3 conditional writes.
-- Automatic failover of the S3 primary bucket. Regional storage disaster recovery is an operator runbook, described below.
+One owner still orders each stream. "Nearest region" chooses where that owner runs. It never means writing in several places at once.
 
 ## The head object is the directory
 
-Stream startup already performs the needed compare-and-set operations (Decision 002): a new stream PUTs `head.json` with `If-None-Match: *`, and an existing stream publishes `epoch + 1` with `If-Match` on the prior ETag. **Head format v3** adds ownership fields:
+Every clustered node shares one primary bucket and prefix. **Head format v3** adds `owner: {node, region, lease_until}` (`lease_until` is a canonical-decimal wall-clock millisecond deadline). The startup compare-and-set operations from Decision 002 double as the ownership protocol, implemented in `archive.claim`:
 
-- `owner_region`: the region whose node owns the open epoch.
-- `owner_node`: an opaque routing hint within that region.
-- `lease_until`: a UTC millisecond deadline. It is meaningful only while `status` is `open`.
+- **Missing head and an authorized publish:** a conditional create (`If-None-Match: *`) with this node's lease.
+- **Closed (sleeping) head, or an open head whose lease plus skew has passed:** `If-Match` on the prior ETag, writing `epoch + 1` and this node's lease. The interrupted-epoch boundary is written as before.
+- **Open head with an unexpired lease held by another node:** no write. The claim returns `Leased(node, region, until)`.
+- **Open head with a lease held by this same node name:** reclaimed immediately. A running BEAM node owns its name, so a lease under that name belongs to a dead owner process.
+- **Standalone recovery:** ignores leases and writes a lease-free v2 head.
 
-Those conditional writes then double as "create here" and "wake here", and S3 resolves races between regions. A losing region receives 412, re-reads the head and routes to the winner. There is no separate global registry. As with v2, older binaries fail closed on v3 heads, and rollbacks need a compatible reader.
+S3 settles races between nodes. A loser receives a precondition failure, its owner exits, and the next request resolves to the winner. Lease node names are validated as `name@host` with a restricted character set before they become distribution atoms, and heads whose version disagrees with lease presence are rejected. Older binaries fail closed on v3 heads.
 
-## Resolution
+## Leases and the live admission fence
 
-A client connects through latency-based DNS or anycast and reaches region R. Before starting or looking up a local owner, R's registry resolves the stream from a bounded local cache, falling back to a GET of the head:
+A clustered primary tracks the lease deadline of its last *confirmed* head write. Every data commit extends the lease. An idle primary rewrites only the lease (`archive.renewal`: same index and archived cursor) once half the term has passed. Failed or ambiguous renewals are retried as the same frozen plan, so reconciliation can recognize a write that actually landed.
 
-| Head state | Action in region R |
-|---|---|
-| Missing, command is an authorized publish | Conditional create with `owner_region = R` and epoch 1. On 412, re-read and resolve again. |
-| Missing, command is subscribe or history | Return the existing not-found behavior. Subscribe never creates a stream. |
-| `closed` (sleeping), or `open` with an expired lease | Conditional `If-Match` write of `epoch + 1` with `owner_region = R`. On 412, re-read and route to the winner. |
-| `open`, valid lease, `owner_region = R` | Hand off to the local owner node (in-region lookup via `pg` or `syn`). |
-| `open`, valid lease, `owner_region = X` | Relay to region X. |
+The owner refuses publishes (`unavailable`) once `now >= lease_until - skew`. A claimant only writes after `lease_until + skew` by its own clock. With clock error below `skew`, the old owner stops admitting before any new owner can start. This closes the gap where head preconditions fenced storage but not live sends. A renewal or commit that later succeeds because nobody claimed the stream resumes admission. A precondition conflict fences the owner; a clustered owner then exits so the registry resolves the stream again. As always, events accepted but unpersisted at that point are the uncertain tail, and recovery reports them with a `discontinuity`.
 
-A finite snapshot (`follow: false`) of a sleeping stream is served from storage without waking it, so a history reader does not pull ownership away from the publishers.
+Standalone owners are never lease-fenced, so storage outages behave exactly as in version one.
 
-Cached routes can go stale. A region that no longer owns a stream answers a relay with `moved {epoch, owner_region}`, and the edge resolves again. Relay links carry the epoch they expect, so a stale route cannot deliver data from an old incarnation.
+## Routing an awake stream: mirrors
 
-## Lifecycle
+A registry always starts a local owner for a requested stream. When that owner's claim returns `Leased(node, …)`, it becomes a **mirror** of the remote primary instead of failing:
 
-- **Awake:** the owner keeps `lease_until` ahead of the current time. Active streams renew it as part of their normal head commits. A quiet stream that still has subscribers writes a renewal at a fraction of the lease period.
-- **Live admission fence:** an owner stops admitting publishes once `lease_until - max_clock_skew` has passed without a confirmed renewal. A taking-over region does not admit publishes until the previous `lease_until + max_clock_skew` has passed and its own conditional head write is confirmed. This closes the gap `architecture.md` describes, where head preconditions fence storage but not live sends.
-- **Sleep:** after N minutes with no publishes and no subscribers, the owner runs a per-stream version of the Decision 004 drain: it closes admission, confirms every pending commit and publishes a closed head.
-- **Wake:** the next touch claims the stream in the toucher's region with `epoch + 1`. Today, recovery emits an interrupted-epoch boundary even after a clean close (Decision 004). Skipping that `discontinuity` when the stream wakes from a confirmed closed head is desirable, but it changes what clients see, so it is a separate versioned change. The first version keeps the conservative boundary.
-- **Crash:** the lease expires, and the next toucher takes over under the fence above. The conservative `discontinuity` applies, as it does for recovery today.
+1. A short-lived process calls `highway@relay:attach/3` on the lease holder through `erpc`. Only fixed module/function entry points are used, never closures. `attach` looks up that node's registry and returns its *primary* owner; it refuses to return a mirror, so mirrors never chain. It also spawns a relay **agent** on the primary's node.
+2. The agent captures a view on the primary from its persisted cursor (everything after it is still in the primary's memory). It sends `Begin(floor)`, then ordered `Events` batches of up to 256, and `Persisted` progress that never runs ahead of events already sent. If it falls behind the primary's live cache, it sends a new `Begin` at the persisted cursor; the mirror treats everything at or before that as archived.
+3. The mirror keeps an ordinary stream state built from that feed. Local sessions capture views, pull, replay and watch persistence against it unchanged; their reads before the mirror's floor go to S3 through the existing replay workers. A gap or foreign cursor in the feed stops the mirror rather than skipping events.
+4. Publishes bypass the mirror actor. `owner.append` sees the stored primary handle and runs `owner:append_here/3` on the primary's node, using that node's monotonic clock. The primary assigns the cursor and applies its own admission and fence. The registry hands mirror publishes back to the caller (`Forward`), so a cross-node round trip never blocks other streams on the edge node.
 
-## BEAM's role
+The agent's first `Begin` can arrive before the `erpc` reply that names it, so a locating owner accepts it; the agent handle is attached when the reply lands. If the reply fails after a feed has started, the mirror exits rather than run without a monitor on its primary. If the holder cannot be reached, the owner retries the locate every second and claims the stream once the lease plus skew has passed. That is crash takeover.
 
-Within a region, nodes cluster with Erlang distribution: DNS-based discovery, `pg` or `syn` to map streams to owner nodes, `pg` for local fan-out, and node monitors so takeover attempts start promptly. `:global`, Horde and `syn` are available during network splits rather than consistent, so they never authorize admission; they are routing hints only. Authority is the head lease. `ra` could later provide faster intra-region fencing if lease waits prove too slow.
+When the primary or its node goes down, the agent exits and the mirror stops abnormally. Local subscribers see the same owner failure as before (`unavailable`, then socket close 1011), and clients reconnect and resume from their cursor. Re-resolution then finds the new owner. There is no separate `moved` frame.
 
-Regions are not joined by distribution, because of the full mesh, head-of-line blocking on one connection per node pair, WAN tick tuning and cookie security. The cross-region relay is an ordinary highway protocol-v2 client. It forwards the end client's scoped JWT, honors credit and resume, and fans out locally through `pg`. Many local subscribers to a remote stream share one upstream subscription.
+Routing is per node. Region is a label recorded in the lease for operators and placement; any node can own any stream, and nodes in one region coordinate exactly as nodes in different regions do.
+
+## Sleep and wake
+
+A clustered primary with nothing pending, no view leases (no subscribers, local or relayed) and no publish or subscribe for `HIGHWAY_SLEEP_IDLE_MS` drains to a closed head and exits. A mirror with no local views for the same period simply exits, releasing its agent's view so the primary can sleep too. Both record the exit in a node-local *retired* table for 60 seconds. A connection holding only a publisher progress watch on a retired owner drops that watch instead of closing the socket; the next publish re-resolves the stream.
+
+A sleeping stream is claimed with `epoch + 1` by whichever node is touched next, with no lease wait. SIGTERM drain also ends in closed heads, so a graceful shutdown hands streams to other nodes immediately. Waking still writes the conservative interrupted-epoch boundary (Decision 004), so resumers see a `discontinuity` across a wake. Skipping it after a confirmed clean close would change what clients see, so it remains a separate, versioned change (*not implemented*).
+
+Streams with any subscriber never sleep; their owner renews its lease instead.
+
+## Transport and trust
+
+Nodes talk over Erlang distribution: `erpc` calls with fixed MFAs, a remote spawn for the agent, cross-node monitors and ordinary message sends for the feed. Connections are opened on demand to the node named in a lease, so no discovery service or full-mesh configuration is needed. If the VM was not booted with `-name`, the server starts distribution itself (running `epmd -daemon` if needed) and applies the shared cookie.
+
+**Distribution is full trust.** Any holder of the cookie can run code on every node. Run nodes on a private network, keep the cookie secret (`HIGHWAY_CLUSTER_COOKIE` or `_FILE`), and use TLS distribution across regions: boot with `ERL_FLAGS="-name … -proto_dist inet_tls -ssl_dist_optfile …"`, which the server detects and keeps. The proposal's alternative of a cross-region relay written as an ordinary highway protocol client, which avoids distribution over WANs, is *not implemented*. Feed batching keeps per-event round trips off the read path, but one distribution connection per node pair still shares head-of-line blocking between streams.
 
 ## Storage topology
 
-Compare-and-set holds only within one bucket. S3 replication, including Cross-Region Replication and Multi-Region Access Points, is asynchronous and resolves conflicts by last writer wins. **Heads therefore live in one primary bucket in one region and are never written through a replica.** Segments and index pages are immutable, use unique keys and are checksummed by SHA256 in the index, so a replica either returns exact bytes or 404. They can be replicated or cached safely.
+Compare-and-set holds only within one bucket, so heads live in one primary bucket in one region and are never written through a replica. Live delivery never waits for S3; distant owners only see slower `accepted`→`persisted` progress, plus the other costs in the proposal (per-stream archival throughput, a larger crash window, slow distant replay, inter-region transfer, and dependence on the primary region).
 
-Selected starting point: **one primary bucket for heads and data.** Live delivery never waits for S3, so owners in distant regions only see slower `accepted`→`persisted` progress. Known costs:
+*Not implemented yet:* region-aware readiness that separates "cannot persist" from "cannot serve" (today a primary-region S3 outage still marks every node unready); parallel segment/index PUTs; read replicas or CloudFront for immutable segments and indexes; the heads-central/data-local layout; and the disaster-recovery runbook (new incarnation on failover; never two-way head replication or active-active Multi-Region Access Points for heads).
 
-- Persistence latency for distant owners: a 250 ms flush plus three sequential round trips (segment, index, head). From a region about 200 ms away, that is roughly 850 ms.
-- Per-stream archival throughput: one commit in flight per stream caps a distant owner near 1 MiB/s or about 4k records/s before the 8 MiB stream pending cap returns `storage_backlog`.
-- A larger crash window for accepted but unpersisted data on distant owners.
-- Replay walks linked index pages one round trip at a time, so a distant reader reaches the 30 s `replay_timeout` after far fewer pages.
-- Inter-region transfer charges on every byte written from outside the bucket's region.
-- If the primary region fails, awake streams keep delivering live until their pending caps fill, while creates, wakes and persistence fail. The current readiness check requires a fresh S3 canary, so it would mark every node in every region unready. Readiness must distinguish "cannot persist" (degraded, keep serving live) from "cannot serve" (unready).
-
-Improvements that need no format change:
-
-1. PUT the segment and index in parallel, then the head. This cuts a commit from three round trips to two.
-2. Confirm that `httpc` reuses TLS connections across regions (`highway_s3_ffi.erl` passes SSL options per request). Otherwise each request pays an extra handshake.
-3. Allow longer flush intervals for distant owners.
-4. Owners reuse the head they last wrote. Only routing lookups GET heads, and those results are cached.
-
-S3 Transfer Acceleration offers little between AWS regions, which already use the AWS backbone, and it requires virtual-hosted requests where highway uses path-style.
-
-Escalations, in order:
-
-- **Read replicas (preferred next step):** Cross-Region Replication filtered to the segment and index prefixes, or CloudFront in front of the primary for those immutable objects. Replay readers try the local copy first and fall back to the primary on 404. Heads are always read from the primary. This fixes distant replay without write-path changes. Costs are replication lag (most objects arrive within seconds, Replication Time Control promises 99.99% within 15 minutes), per-object request charges multiplied by replica regions, and duplicated storage.
-- **Heads central, data local:** owners write segments and indexes to their own region's bucket and only the head to the primary bucket. A commit's cross-region cost drops to one round trip and most bytes stay local. This needs an index format change (bucket or region per entry), history that spans several buckets after a stream wakes elsewhere, and IAM, readiness and conformance checks per bucket. Adopt it only if measured egress or persistence latency justifies it.
-- **Disaster recovery runbook (not automated):** replicate everything, including heads, to a standby. A replicated head may lag the primary, and replication does not preserve order across objects, so it can reference an index that has not arrived yet. On operator failover, every stream starts a new `incarnation` or treats its tail as interrupted, and clients resume across a declared `discontinuity`. Two-way head replication, and Multi-Region Access Points in active-active mode for head writes, are prohibited.
-
-## Configuration sketch
+## Configuration
 
 ```sh
+HIGHWAY_STORAGE_MODE=s3_async           # required; memory mode cannot cluster
+HIGHWAY_CLUSTER_NODE=highway-a@10.0.1.5 # enables cluster mode
 HIGHWAY_REGION=eu-west-1
-HIGHWAY_PEERS_FILE=/etc/highway/regions.json   # region -> private relay endpoint
-HIGHWAY_LEASE_MS=10000
-HIGHWAY_MAX_CLOCK_SKEW_MS=1000
-HIGHWAY_SLEEP_IDLE_MS=300000
+HIGHWAY_CLUSTER_COOKIE_FILE=/run/secrets/highway-cookie
+HIGHWAY_LEASE_MS=10000                  # 1000..120000
+HIGHWAY_MAX_CLOCK_SKEW_MS=1000          # <= lease / 4
+HIGHWAY_SLEEP_IDLE_MS=300000            # 0 disables sleep; otherwise >= lease
 ```
 
-Every region shares one JWT issuer, audience and JWKS. `HIGHWAY_S3_BUCKET` names the primary bucket in every region.
+Every node uses the same bucket, prefix, JWT issuer, audience and JWKS. Idle awake streams cost one head PUT per half lease term; sleeping streams cost nothing.
 
-## Phasing
+## Verification
 
-1. Head v3 with the lease fields, renewal, and the live admission fence. Deterministic tests cover lease expiry, clock-skew margins, concurrent claims, and a stale owner that must stop admitting.
-2. A per-stream idle drain to a closed head, plus handoff between two nodes in one region with in-region clustering.
-3. The edge resolve step and the relay client across regions, with `moved` re-resolution.
-4. Region-aware readiness and the commit latency improvements above. Measure persistence and replay from a distant region against the primary bucket using `smoke-release` and `s3-conformance`.
-5. Read replicas for immutable objects, then the optional versioned clean-wake change that drops the `discontinuity`.
+`test/highway/cluster_test.gleam` covers v3 encoding and validation, claims against unexpired, expired, same-node and closed heads, standalone v2 fallback, lease-only renewal, an owner that waits out an unreachable holder's lease plus skew before taking over, admission fencing while head writes fail and resumption after the frozen retry commits, idle renewal without history change, and sleep to a closed head.
+
+`make smoke-cluster` runs two native shipments as `us-east-1` and `eu-west-1` nodes against the loopback S3 fixture. It verifies, in order: creation on the node a client reached; a subscriber on the other node receiving through a mirror with identical cursors; a publish on the non-owner forwarded and ordered by the owner; persisted notices delivered to that publisher; history from the non-owner in exact order; SIGKILL of the owner followed by takeover only after the lease, with a `discontinuity` and a new epoch; sleep without disconnecting an idle publisher; wake on the other node with no lease wait and full history; a remote mirror idling out so the primary can sleep again; and SIGTERM drain handing a stream to the other node at once. All existing checks and smokes pass unchanged in standalone mode.
 
 ## Open questions
 
-- Should a quiet stream with subscribers but no publishers sleep, which requires a way to wake it when a publish arrives elsewhere, or keep renewing its lease?
-- Default lease length and clock-skew margin, and how hosts will bound clock skew (for example, the Amazon Time Sync Service).
-- Whether owners should later move proactively based on where publishers are, in addition to moving on wake.
-- How relay links are authenticated between regions (mTLS or a private network), alongside the forwarded client JWT.
+- Default lease and skew for production, and how hosts bound clock skew (for example, the Amazon Time Sync Service).
+- Whether owners should move proactively towards their publishers, in addition to moving on wake.
+- Replacing distribution across regions with a protocol-client relay, if WAN head-of-line blocking or the trust model proves limiting.

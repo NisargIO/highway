@@ -1,12 +1,16 @@
 import gleam/dict
 import gleam/erlang/process.{type Subject}
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
+import highway/cluster
 import highway/config.{type Limits}
-import highway/domain.{type Cursor, type Error, type Event}
+import highway/domain.{
+  type Cursor, type Error, type Event, type Stream, type Tenant,
+}
 import highway/observability as logging
 import highway/operations
 import highway/protocol
@@ -14,6 +18,7 @@ import highway/replay/view
 import highway/runtime
 import highway/storage.{type Store}
 import highway/storage/archive
+import highway/storage/format
 import highway/storage/worker
 import highway/stream
 
@@ -25,6 +30,21 @@ type Message {
   Request(runtime.Permit, Operation)
   Tick
   Storage(worker.Reply)
+  Upstream(Feed)
+  Located(
+    node: String,
+    result: Result(Result(#(Owner, process.Pid), Error), Nil),
+  )
+  Down(process.Down)
+}
+
+/// Ordered relay feed from the primary owner's agent to a mirror owner.
+/// `Begin` marks the exclusive start (everything before it is archived);
+/// `Persisted` never exceeds the last cursor already sent in `Events`.
+pub type Feed {
+  Begin(Cursor)
+  Events(List(Event))
+  Persisted(Cursor)
 }
 
 type Operation {
@@ -50,6 +70,14 @@ type ArchiveState {
   Closing(archive.Closure)
   RetryClose(archive.Closure)
   Closed
+  /// Clustered: another node's lease is current. Locate it or wait it out.
+  Elsewhere(node: String, until: Int)
+  Locating(node: String, until: Int)
+  /// Clustered: a local read replica of a remote primary. Publishes bypass
+  /// this actor and go straight to the primary; `ready` follows `Begin`.
+  Mirror(node: String, ready: Bool)
+  Renewing(archive.Closure)
+  RetryRenew(archive.Closure)
 }
 
 type State {
@@ -66,6 +94,13 @@ type State {
     leases: dict.Dict(String, view.Lease),
     draining: Bool,
     metrics: Option(operations.Context),
+    cluster: config.Cluster,
+    key: #(Tenant, Stream),
+    feed: Subject(Feed),
+    agent: Option(process.Pid),
+    lease_until: Int,
+    activity_ms: Int,
+    sleeping: Bool,
   )
 }
 
@@ -91,9 +126,32 @@ pub fn start_operational(
   slots: runtime.Slots,
   metrics: Option(operations.Context),
 ) -> actor.StartResult(Owner) {
+  start_cluster(
+    limits,
+    store,
+    scope,
+    create,
+    slots,
+    metrics,
+    config.Standalone,
+    #(domain.Tenant(""), domain.Stream("")),
+  )
+}
+
+pub fn start_cluster(
+  limits: Limits,
+  store: Option(Store),
+  scope: String,
+  create: Bool,
+  slots: runtime.Slots,
+  metrics: Option(operations.Context),
+  cluster: config.Cluster,
+  key: #(Tenant, Stream),
+) -> actor.StartResult(Owner) {
   actor.new_with_initialiser(1000, fn(subject) {
     let gate = runtime.slots()
     let replies = process.new_subject()
+    let feed = process.new_subject()
     let initial =
       State(
         stream.new(runtime.incarnation()),
@@ -108,6 +166,13 @@ pub fn start_operational(
         dict.new(),
         False,
         metrics,
+        cluster,
+        key,
+        feed,
+        None,
+        0,
+        runtime.monotonic_ms(),
+        False,
       )
     let initial = case store {
       None -> Ok(initial)
@@ -116,7 +181,10 @@ pub fn start_operational(
           worker.start(store, slots, process.self())
           |> result.map_error(fn(_) { "storage worker startup failed" }),
         )
-        process.send(writer.data, worker.Open(scope, create, replies))
+        process.send(
+          writer.data,
+          worker.Open(scope, create, claimant(cluster), replies),
+        )
         Ok(State(..initial, writer: Some(writer.data), archive: Opening))
       }
     }
@@ -127,7 +195,9 @@ pub fn start_operational(
     |> actor.selecting(
       process.new_selector()
       |> process.select(subject)
-      |> process.select_map(replies, Storage),
+      |> process.select_map(replies, Storage)
+      |> process.select_map(feed, Upstream)
+      |> process.select_monitors(Down),
     )
     |> actor.returning(#(subject, gate))
     |> Ok
@@ -161,6 +231,7 @@ pub fn start_operational(
                     actor.continue(
                       State(
                         ..state,
+                        activity_ms: runtime.monotonic_ms(),
                         leases: dict.insert(
                           state.leases,
                           v.id,
@@ -212,7 +283,14 @@ pub fn start_operational(
                     process.send(reply, Error(domain.Unavailable))
                     actor.continue(next)
                   }
-                  Opening | Fenced -> {
+                  Opening
+                  | Fenced
+                  | Elsewhere(_, _)
+                  | Locating(_, _)
+                  | Mirror(_, _)
+                  | Closing(_)
+                  | RetryClose(_)
+                  | Closed -> {
                     runtime.release_bytes(
                       state.gate,
                       stream.event_bytes(id, data),
@@ -221,8 +299,21 @@ pub fn start_operational(
                     actor.continue(state)
                   }
                   _ ->
-                    case stream.append(state.stream, id, data, limits, now) {
-                      Error(e) -> {
+                    case
+                      lease_fenced(state),
+                      stream.append(state.stream, id, data, limits, now)
+                    {
+                      True, _ -> {
+                        // The confirmed lease is about to lapse: another node
+                        // may claim the stream, so stop admitting first.
+                        runtime.release_bytes(
+                          state.gate,
+                          stream.event_bytes(id, data),
+                        )
+                        process.send(reply, Error(domain.Unavailable))
+                        actor.continue(state)
+                      }
+                      False, Error(e) -> {
                         runtime.release_bytes(
                           state.gate,
                           stream.event_bytes(id, data),
@@ -230,8 +321,13 @@ pub fn start_operational(
                         process.send(reply, Error(e))
                         actor.continue(state)
                       }
-                      Ok(#(next, event)) -> {
-                        let next = State(..state, stream: next)
+                      False, Ok(#(next, event)) -> {
+                        let next =
+                          State(
+                            ..state,
+                            stream: next,
+                            activity_ms: runtime.monotonic_ms(),
+                          )
                         account(next, limits)
                         runtime.release_bytes(
                           state.gate,
@@ -258,7 +354,12 @@ pub fn start_operational(
             }
           Watermark(reply) -> {
             let result = case state.archive {
-              Starting | Opening | Fenced -> Error(domain.Unavailable)
+              Starting
+              | Opening
+              | Fenced
+              | Elsewhere(_, _)
+              | Locating(_, _)
+              | Mirror(_, False) -> Error(domain.Unavailable)
               Missing -> Error(domain.StreamNotFound)
               _ -> Ok(stream.watermark(state.stream))
             }
@@ -267,7 +368,8 @@ pub fn start_operational(
           }
           Read(c, reply) -> {
             process.send(reply, case state.archive {
-              Fenced -> Error(domain.Unavailable)
+              Fenced | Elsewhere(_, _) | Locating(_, _) | Mirror(_, False) ->
+                Error(domain.Unavailable)
               _ -> stream.next(state.stream, c)
             })
             actor.continue(state)
@@ -289,18 +391,139 @@ pub fn start_operational(
               True -> send_commit(state, plan)
               False -> state
             }
+          RetryRenew(plan) ->
+            case runtime.monotonic_ms() >= state.retry_ms {
+              True -> send_renew(state, plan)
+              False -> state
+            }
+          Elsewhere(node, until) -> {
+            let wall = runtime.wall_ms()
+            case state.cluster {
+              config.Clustered(skew_ms: skew, ..) if wall >= until + skew ->
+                send_open(state, state.create)
+              _ ->
+                case runtime.monotonic_ms() >= state.retry_ms {
+                  True -> locate(state, node, until)
+                  False -> state
+                }
+            }
+          }
           Active(_) ->
             case state.draining {
               True -> drain_step(state)
-              False -> flush(state)
+              False -> flush(state) |> renew |> sleep
             }
+          Mirror(_, True) -> sleep(state)
           _ -> state
         }
-        account(next, limits)
-        actor.continue(next)
+        finish(next, limits)
       }
+      Upstream(feed) ->
+        case state.archive, feed {
+          // The agent's first frame can overtake the erpc reply that names it:
+          // only an agent given this owner's feed subject can send it.
+          Mirror(node, False), Begin(start) | Locating(node, _), Begin(start) -> {
+            let model =
+              stream.State(
+                ..stream.new(start.incarnation),
+                epoch: start.epoch,
+                offset: start.offset,
+                persisted: start.offset,
+              )
+            finish(
+              State(..state, stream: model, archive: Mirror(node, True)),
+              limits,
+            )
+          }
+          Mirror(_, True), _ ->
+            case mirror(state.stream, feed) {
+              Ok(model) -> finish(State(..state, stream: model), limits)
+              Error(reason) -> {
+                logging.log(logging.Warning, "Mirror feed rejected: " <> reason)
+                actor.stop_abnormal("mirror feed out of order")
+              }
+            }
+          _, _ -> actor.continue(state)
+        }
+      Located(node, outcome) ->
+        case state.archive, outcome {
+          Locating(expected, _), Ok(Ok(#(primary, agent)))
+          | Mirror(expected, _), Ok(Ok(#(primary, agent)))
+            if expected == node && state.agent == None
+          -> {
+            let _ = process.monitor(agent)
+            set_upstream(state.gate, primary)
+            let archive = case state.archive {
+              Mirror(_, ready) -> Mirror(node, ready)
+              _ -> Mirror(node, False)
+            }
+            finish(State(..state, archive: archive, agent: Some(agent)), limits)
+          }
+          // A feed already started but its agent handle was lost: without a
+          // monitor this mirror could outlive its primary, so start over.
+          Mirror(expected, _), _ if expected == node && state.agent == None ->
+            actor.stop_abnormal("mirror agent unconfirmed")
+          Locating(expected, until), failed if expected == node -> {
+            logging.log(
+              logging.Warning,
+              "Stream owner locate on "
+                <> node
+                <> " failed: "
+                <> case failed {
+                Ok(Error(e)) -> domain.code(e)
+                _ -> "transport"
+              },
+            )
+            finish(
+              State(
+                ..state,
+                archive: Elsewhere(node, until),
+                retry_ms: runtime.monotonic_ms() + 1000,
+              ),
+              limits,
+            )
+          }
+          _, _ -> {
+            case outcome {
+              Ok(Ok(#(_, agent))) -> process.kill(agent)
+              _ -> Nil
+            }
+            actor.continue(state)
+          }
+        }
+      Down(process.ProcessDown(pid: pid, ..)) ->
+        case state.agent == Some(pid) {
+          True -> actor.stop_abnormal("mirror upstream lost")
+          False -> actor.continue(state)
+        }
+      Down(_) -> actor.continue(state)
       Storage(worker.Closed(epoch, id, outcome)) -> {
         let next = case state.archive {
+          Renewing(plan)
+            if plan.next.epoch == epoch && plan.next.commit_id == id
+          ->
+            case outcome {
+              Ok(session) ->
+                State(
+                  ..state,
+                  archive: Active(session),
+                  lease_until: lease_of(session),
+                )
+              Error(storage.Conflict)
+              | Error(storage.Precondition)
+              | Error(storage.Corrupt(_)) -> {
+                log_error(outcome)
+                State(..state, archive: Fenced)
+              }
+              Error(_) -> {
+                log_error(outcome)
+                State(
+                  ..state,
+                  archive: RetryRenew(plan),
+                  retry_ms: runtime.monotonic_ms() + 1000,
+                )
+              }
+            }
           Closing(plan)
             if plan.next.epoch == epoch && plan.next.commit_id == id
           ->
@@ -326,8 +549,7 @@ pub fn start_operational(
             state
           }
         }
-        account(next, limits)
-        actor.continue(next)
+        finish(next, limits)
       }
       Storage(worker.Opened(outcome)) -> {
         let next = case state.archive {
@@ -341,8 +563,12 @@ pub fn start_operational(
                     epoch: session.head.epoch,
                   ),
                   archive: Active(session),
+                  lease_until: lease_of(session),
+                  activity_ms: runtime.monotonic_ms(),
                 )
               Error(storage.NotFound) -> State(..state, archive: Missing)
+              Error(storage.Leased(node, _, until)) ->
+                locate(state, node, until)
               Error(storage.Conflict)
               | Error(storage.Precondition)
               | Error(storage.Corrupt(_)) -> {
@@ -356,8 +582,7 @@ pub fn start_operational(
             }
           _ -> state
         }
-        account(next, limits)
-        actor.continue(next)
+        finish(next, limits)
       }
       Storage(worker.Committed(epoch, id, outcome)) -> {
         let next = case state.archive {
@@ -379,7 +604,12 @@ pub fn start_operational(
                       state.stream.bytes - model.bytes,
                     )
                     let next =
-                      State(..state, stream: model, archive: Active(session))
+                      State(
+                        ..state,
+                        stream: model,
+                        archive: Active(session),
+                        lease_until: lease_of(session),
+                      )
                     case next.draining {
                       True -> drain_step(next)
                       False -> next
@@ -407,8 +637,7 @@ pub fn start_operational(
             state
           }
         }
-        account(next, limits)
-        actor.continue(next)
+        finish(next, limits)
       }
     }
   })
@@ -430,7 +659,10 @@ fn log_error(outcome: Result(a, storage.Error)) -> Nil {
 fn send_open(state: State, create: Bool) -> State {
   case state.writer {
     Some(writer) -> {
-      process.send(writer, worker.Open(state.scope, create, state.replies))
+      process.send(
+        writer,
+        worker.Open(state.scope, create, claimant(state.cluster), state.replies),
+      )
       State(..state, archive: Opening, create: create)
     }
     None -> state
@@ -453,7 +685,9 @@ fn flush(state: State) -> State {
       case stream.batch(state.stream, 1_048_576) {
         [] -> state
         events ->
-          case archive.plan(session, events) {
+          case
+            archive.plan_leased(session, events, next_lease(state, session))
+          {
             Ok(plan) -> send_commit(state, plan)
             Error(e) -> {
               logging.log(
@@ -469,16 +703,25 @@ fn flush(state: State) -> State {
 }
 
 fn account(s: State, limits: Limits) -> Nil {
+  let mirroring = case s.archive {
+    Mirror(_, _) -> True
+    _ -> False
+  }
   runtime.set_drained(
     s.gate,
     s.archive == Closed
       || s.archive == Missing
-      || { s.archive == Memory && s.draining },
+      || { s.archive == Memory && s.draining }
+      || { mirroring && s.draining },
   )
   runtime.set_missing(s.gate, s.archive == Missing)
   let healthy = case s.archive {
-    Active(_) | Writing(_) -> True
-    Memory
+    Active(_) | Writing(_) | Renewing(_) | Mirror(_, True) -> True
+    Elsewhere(_, _)
+    | Locating(_, _)
+    | Mirror(_, False)
+    | RetryRenew(_)
+    | Memory
     | Starting
     | Missing
     | Opening
@@ -501,12 +744,17 @@ fn account(s: State, limits: Limits) -> Nil {
       ))
     False -> None
   }
+  // A mirror buffers a remote primary's events; it holds no local pending.
+  let pending = case mirroring {
+    True -> 0
+    False -> s.stream.bytes
+  }
   runtime.set_account(
     s.gate,
-    s.stream.bytes,
+    pending,
     healthy
-      && age_ok
-      && s.stream.bytes < limits.stream_bytes
+      && { mirroring || age_ok && !lease_fenced(s) }
+      && pending < limits.stream_bytes
       && dict.size(s.stream.times) < limits.max_records,
     progress,
   )
@@ -517,6 +765,41 @@ pub fn stats(o: Owner) -> #(Int, Bool, Option(Cursor)) {
 }
 
 pub fn append(
+  owner: Owner,
+  id: String,
+  data: json.Json,
+  now: Int,
+) -> Result(Event, Error) {
+  case get_upstream(owner.gate) {
+    // Mirrors never order events: the remote primary assigns the cursor.
+    Ok(primary) ->
+      case remote_append(cluster.pid_node(pid(primary)), primary, id, data) {
+        Ok(outcome) -> outcome
+        Error(_) -> Error(domain.Unavailable)
+      }
+    Error(_) -> append_local(owner, id, data, now)
+  }
+}
+
+/// Remote entry point for a mirror's forwarded publish, executed on the
+/// primary's node with that node's monotonic clock. It never forwards again.
+pub fn append_here(
+  owner: Owner,
+  id: String,
+  data: json.Json,
+) -> Result(Event, Error) {
+  case forwarding(owner) {
+    True -> Error(domain.Unavailable)
+    False -> append_local(owner, id, data, runtime.monotonic_ms())
+  }
+}
+
+/// True for a mirror whose publishes go to a remote primary.
+pub fn forwarding(owner: Owner) -> Bool {
+  result.is_ok(get_upstream(owner.gate))
+}
+
+fn append_local(
   owner: Owner,
   id: String,
   data: json.Json,
@@ -583,6 +866,12 @@ pub fn stop(owner: Owner) -> Result(Nil, Error) {
   |> result.unwrap(Error(domain.Unavailable))
 }
 
+/// True after an owner exited deliberately (slept or idle mirror) rather than
+/// failing. Connections drop its progress watches without closing.
+pub fn retired(o: Owner) -> Bool {
+  !alive(o) && cluster.retired(pid(o))
+}
+
 pub fn missing(o: Owner) -> Bool {
   runtime.is_missing(o.gate)
 }
@@ -602,7 +891,12 @@ fn capture(s: State, from: protocol.From) -> Result(view.View, Error) {
     False -> Ok(Nil)
   })
   use _ <- result.try(case s.archive {
-    Starting | Opening | Fenced -> Error(domain.Unavailable)
+    Starting
+    | Opening
+    | Fenced
+    | Elsewhere(_, _)
+    | Locating(_, _)
+    | Mirror(_, False) -> Error(domain.Unavailable)
     Missing -> Error(domain.StreamNotFound)
     _ -> Ok(Nil)
   })
@@ -645,7 +939,8 @@ fn pull_state(s: State, id: String, after: Cursor) -> Result(view.Pull, Error) {
     },
   )
   use _ <- result.try(case s.archive {
-    Fenced -> Error(domain.Unavailable)
+    Fenced | Elsewhere(_, _) | Locating(_, _) | Mirror(_, False) ->
+      Error(domain.Unavailable)
     _ -> Ok(Nil)
   })
   let tail = stream.watermark(s.stream)
@@ -732,4 +1027,213 @@ pub fn begin_drain(o: Owner) -> Result(Nil, Error) {
 
 pub fn drained(o: Owner) -> Bool {
   alive(o) && runtime.is_drained(o.gate)
+}
+
+@external(erlang, "highway_cluster_ffi", "put_upstream")
+fn set_upstream(gate: runtime.Slots, primary: Owner) -> Nil
+
+@external(erlang, "highway_cluster_ffi", "get_upstream")
+fn get_upstream(gate: runtime.Slots) -> Result(Owner, Nil)
+
+@external(erlang, "highway_cluster_ffi", "append")
+fn remote_append(
+  node: String,
+  primary: Owner,
+  id: String,
+  data: json.Json,
+) -> Result(Result(Event, Error), Nil)
+
+@external(erlang, "highway_cluster_ffi", "attach")
+fn remote_attach(
+  node: String,
+  tenant: Tenant,
+  stream: Stream,
+  feed: Subject(Feed),
+) -> Result(Result(#(Owner, process.Pid), Error), Nil)
+
+fn claimant(cluster: config.Cluster) -> Option(archive.Claimant) {
+  case cluster {
+    config.Standalone -> None
+    config.Clustered(node, region, lease, skew, _) ->
+      Some(archive.Claimant(node, region, 0, lease, skew))
+  }
+}
+
+fn lease_of(session: archive.Session) -> Int {
+  case session.head.owner {
+    Some(lease) -> lease.until
+    None -> 0
+  }
+}
+
+fn next_lease(state: State, session: archive.Session) -> Option(format.Lease) {
+  case state.cluster {
+    config.Standalone -> session.head.owner
+    config.Clustered(node, region, lease, _, _) ->
+      Some(format.Lease(node, region, runtime.wall_ms() + lease))
+  }
+}
+
+/// Live admission fence: a clustered owner stops admitting `skew` before its
+/// confirmed lease ends; claimants wait until `skew` after it.
+fn lease_fenced(state: State) -> Bool {
+  case state.cluster, state.archive {
+    config.Standalone, _ | _, Memory -> False
+    config.Clustered(skew_ms: skew, ..), _ ->
+      runtime.wall_ms() >= state.lease_until - skew
+  }
+}
+
+/// Renew an idle clustered lease halfway through its term. Data commits renew
+/// too, so this only runs while nothing is pending.
+fn renew(state: State) -> State {
+  case state.cluster, state.archive {
+    config.Clustered(node, region, lease, _, _), Active(session) ->
+      case runtime.wall_ms() >= state.lease_until - lease / 2 {
+        True ->
+          send_renew(
+            state,
+            archive.renewal(
+              session,
+              format.Lease(node, region, runtime.wall_ms() + lease),
+            ),
+          )
+        False -> state
+      }
+    _, _ -> state
+  }
+}
+
+fn send_renew(state: State, plan: archive.Closure) -> State {
+  case state.writer {
+    Some(writer) -> {
+      process.send(writer, worker.Close(plan, state.replies))
+      State(..state, archive: Renewing(plan))
+    }
+    None -> state
+  }
+}
+
+/// Sleep: an idle clustered stream with nothing pending and no readers closes
+/// its head so the next client can wake it in the nearest region.
+fn sleep(state: State) -> State {
+  case state.cluster, state.archive {
+    config.Clustered(sleep_ms: idle, ..), Active(_)
+      if idle > 0 && state.stream.bytes == 0 && !state.draining
+    ->
+      case
+        dict.is_empty(state.leases)
+        && runtime.monotonic_ms() - state.activity_ms >= idle
+      {
+        True -> drain_step(State(..state, draining: True, sleeping: True))
+        False -> state
+      }
+    // An idle mirror simply exits, releasing its view on the primary so the
+    // primary can sleep too. The next local request attaches a fresh mirror.
+    config.Clustered(sleep_ms: idle, ..), Mirror(_, True) if idle > 0 ->
+      case
+        dict.is_empty(state.leases)
+        && runtime.monotonic_ms() - state.activity_ms >= idle
+      {
+        True -> State(..state, sleeping: True)
+        False -> state
+      }
+    _, _ -> state
+  }
+}
+
+/// Ask the lease holder for its primary owner and start a relay agent there.
+/// Distribution setup can block, so it runs outside the owner actor.
+fn locate(state: State, node: String, until: Int) -> State {
+  case state.cluster {
+    config.Standalone -> State(..state, archive: Fenced)
+    config.Clustered(..) -> {
+      let subject = state.subject
+      let #(tenant, stream_id) = state.key
+      let feed = state.feed
+      process.spawn_unlinked(fn() {
+        process.send(
+          subject,
+          Located(node, remote_attach(node, tenant, stream_id, feed)),
+        )
+      })
+      State(..state, archive: Locating(node, until))
+    }
+  }
+}
+
+fn finish(state: State, limits: Limits) -> actor.Next(State, Message) {
+  account(state, limits)
+  case state.cluster, state.archive {
+    // A clustered owner that lost its head (or finished sleeping) exits so the
+    // registry re-resolves the stream on the next request.
+    config.Clustered(..), Fenced -> actor.stop_abnormal("ownership fenced")
+    config.Clustered(..), Mirror(_, _) if state.sleeping -> {
+      cluster.retire(process.self())
+      actor.stop()
+    }
+    config.Clustered(..), Closed if state.sleeping -> {
+      cluster.retire(process.self())
+      case state.writer {
+        Some(writer) ->
+          case process.subject_owner(writer) {
+            Ok(pid) -> {
+              process.unlink(pid)
+              process.kill(pid)
+            }
+            Error(_) -> Nil
+          }
+        None -> Nil
+      }
+      actor.stop()
+    }
+    _, _ -> actor.continue(state)
+  }
+}
+
+/// Apply one relay feed message to mirror state. Gaps or foreign cursors are
+/// errors: a mirror must never invent or skip upstream events.
+fn mirror(s: stream.State, feed: Feed) -> Result(stream.State, String) {
+  case feed {
+    Begin(start) ->
+      case
+        start.incarnation == s.incarnation
+        && start.epoch == s.epoch
+        && start.offset >= s.offset
+      {
+        True ->
+          Ok(
+            stream.State(
+              ..s,
+              offset: start.offset,
+              persisted: start.offset,
+              events: dict.new(),
+              bytes: 0,
+            ),
+          )
+        False -> Error("restart outside mirrored epoch")
+      }
+    Events(events) ->
+      list.try_fold(events, s, fn(m, e) {
+        case e.cursor == domain.Cursor(m.incarnation, m.epoch, m.offset + 1) {
+          True ->
+            Ok(
+              stream.State(
+                ..m,
+                offset: m.offset + 1,
+                bytes: m.bytes + e.bytes,
+                events: dict.insert(m.events, e.cursor.offset, e),
+              ),
+            )
+          False -> Error("noncontiguous mirrored event")
+        }
+      })
+    Persisted(through) ->
+      case through.offset <= s.persisted {
+        True -> Ok(s)
+        False ->
+          stream.committed(s, through)
+          |> result.replace_error("mirrored persistence ahead of feed")
+      }
+  }
 }

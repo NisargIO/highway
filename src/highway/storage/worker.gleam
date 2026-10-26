@@ -1,5 +1,6 @@
 import exception
 import gleam/erlang/process.{type Subject}
+import gleam/option.{type Option}
 import gleam/otp/actor
 import gleam/result
 import highway/runtime
@@ -7,7 +8,12 @@ import highway/storage.{type Error, type Store}
 import highway/storage/archive
 
 pub type Request {
-  Open(scope: String, create: Bool, reply: Subject(Reply))
+  Open(
+    scope: String,
+    create: Bool,
+    claimant: Option(archive.Claimant),
+    reply: Subject(Reply),
+  )
   Commit(plan: archive.Plan, reply: Subject(Reply))
   Close(archive.Closure, Subject(Reply))
   OwnerDown
@@ -52,9 +58,14 @@ pub fn start(
         )
         actor.continue(Nil)
       }
-      Open(scope, create, reply) -> {
+      Open(scope, create, claimant, reply) -> {
+        // Lease deadlines start when the claim is attempted, not when queued.
+        let claimant =
+          option.map(claimant, fn(c) {
+            archive.Claimant(..c, now_ms: runtime.wall_ms())
+          })
         let outcome =
-          bounded(slots, fn() { archive.open(store, scope, create) })
+          bounded(slots, fn() { archive.claim(store, scope, create, claimant) })
         process.send(reply, Opened(outcome))
         actor.continue(Nil)
       }

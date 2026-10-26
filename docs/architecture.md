@@ -131,9 +131,11 @@ Fixed node-level metrics expose acceptance/persistence progress, pending bytes, 
 
 ## Deployment and future work
 
-Version one runs exactly one BEAM node against a storage prefix. Use stop-then-start deployment; overlapping rolling updates are unsupported. S3 head preconditions detect conflicting persistence, but do not fence a stale process from sending live events. They are not a distributed lease. Automatic takeover requires an ownership design that fences both live and storage paths. [Decision 006](decisions/006-multi-region-ownership.md) proposes one, not yet implemented: head leases, a single-endpoint resolver for each stream's region, and a single primary bucket for heads.
+Standalone mode runs exactly one BEAM node against a storage prefix. Use stop-then-start deployment; overlapping rolling updates are unsupported. In standalone mode, S3 head preconditions detect conflicting persistence but do not fence a stale process from sending live events.
 
-Defer clustering, multi-region writes, consumer groups, server-stored consumer offsets, arbitrary filtering, search, compaction, retention deletion, and S2 API compatibility. Initial history is append-only with no automatic deletion. Never enable lifecycle deletion for referenced segments without retention metadata and replay semantics.
+Opt-in cluster mode ([Decision 006](decisions/006-multi-region-ownership.md)) lets many nodes, in one or more regions, share a prefix behind one endpoint. Head v3 carries an ownership lease. A primary stops admitting publishes before its confirmed lease ends, and other nodes claim only after it plus a skew margin, which fences both the live and storage paths. A node reached for a stream owned elsewhere runs a local mirror fed by a relay agent on the primary's node over Erlang distribution, and forwards publishes to the primary. Idle streams sleep to closed heads and wake on whichever node is touched next. Clustering does not add multi-writer streams, and the single primary bucket for heads remains.
+
+Defer multi-writer streams, consumer groups, server-stored consumer offsets, arbitrary filtering, search, compaction, retention deletion, and S2 API compatibility. Initial history is append-only with no automatic deletion. Never enable lifecycle deletion for referenced segments without retention metadata and replay semantics.
 
 S3 request counts scale with active streams and flush frequency. A full batch normally writes a segment, index, and head; many quiet streams can create many small objects. Measure this before promising costs or throughput. Cross-stream archival batching could reduce requests later but introduces a more complex commit/index design.
 

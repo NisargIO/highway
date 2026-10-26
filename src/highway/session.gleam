@@ -1192,7 +1192,21 @@ fn progress(state: State, now: Int) -> Step {
   let state = prune_watches(state, now)
   dict.fold(state.watches, success(state, []), fn(step, stream, w) {
     case owner.alive(w.owner) {
-      False -> Step(step.state, step.responses, Some(1011))
+      // A slept owner already confirmed everything it accepted; the next
+      // publish re-resolves the stream and watches its new owner.
+      False ->
+        case owner.retired(w.owner) {
+          True ->
+            Step(
+              State(
+                ..step.state,
+                watches: dict.delete(step.state.watches, stream),
+              ),
+              step.responses,
+              step.close,
+            )
+          False -> Step(step.state, step.responses, Some(1011))
+        }
       True ->
         case owner.stats(w.owner).2 {
           Some(c) if w.through != Some(c) ->

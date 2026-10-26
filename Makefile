@@ -52,6 +52,10 @@ smoke-release: release
 image:
 	docker build -t highway:0.1.0 .
 
+.PHONY: smoke-cluster
+smoke-cluster: release
+	node examples/cluster-smoke.mjs
+
 .PHONY: sdk-check smoke-container benchmark
 sdk-check:
 	npm --prefix sdk/javascript ci --ignore-scripts

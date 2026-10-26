@@ -5,6 +5,10 @@ import mist
 @external(erlang, "highway_runtime_ffi", "now")
 pub fn now() -> Int
 
+/// Wall-clock milliseconds, used only for cross-node ownership leases.
+@external(erlang, "highway_runtime_ffi", "wall_ms")
+pub fn wall_ms() -> Int
+
 @external(erlang, "highway_runtime_ffi", "monotonic_ms")
 pub fn monotonic_ms() -> Int
 
